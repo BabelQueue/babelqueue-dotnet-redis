@@ -1,0 +1,12 @@
+bin/
+obj/
+*.user
+
+# Coverlet coverage artifacts
+coverage.cobertura.xml
+coverage.json
+coverage.opencover.xml
+*.coverage
+
+# CommitBrief local config and cache
+.commitbrief/
