@@ -90,15 +90,20 @@ public sealed class RedisConsumer
         }
     }
 
-    private async Task HandleAsync(string rawBody, CancellationToken cancellationToken)
+    private async Task HandleAsync(string reserved, CancellationToken cancellationToken)
     {
-        var envelope = EnvelopeCodec.Decode(rawBody);
+        // The reserved list value is the LREM ack handle (frame or bare). Unframe it so the handler
+        // sees the §1.2 wire-envelope body and any out-of-band headers (ADR-0028) ride alongside; a
+        // bare value yields the value verbatim with no headers, so cross-version queues interoperate.
+        var (body, headers) = RedisFrame.Unframe(reserved);
+
+        var envelope = EnvelopeCodec.Decode(body);
 
         if (!EnvelopeCodec.Accepts(envelope))
         {
             _options.OnError?.Invoke(
                 new BabelQueueException("Rejected a non-conformant BabelQueue envelope from Redis."),
-                envelope, rawBody);
+                envelope, body);
             return;
         }
 
@@ -107,12 +112,12 @@ public sealed class RedisConsumer
         {
             if (_options.OnUnknownUrn is not null)
             {
-                await _options.OnUnknownUrn(envelope, rawBody, cancellationToken).ConfigureAwait(false);
-                await AckAsync(rawBody).ConfigureAwait(false);
+                await _options.OnUnknownUrn(envelope, body, cancellationToken).ConfigureAwait(false);
+                await AckAsync(reserved).ConfigureAwait(false);
             }
             else
             {
-                _options.OnError?.Invoke(new UnknownUrnException(urn), envelope, rawBody);
+                _options.OnError?.Invoke(new UnknownUrnException(urn), envelope, body);
             }
 
             return;
@@ -120,19 +125,22 @@ public sealed class RedisConsumer
 
         try
         {
-            await handler(envelope, rawBody, cancellationToken).ConfigureAwait(false);
-            await AckAsync(rawBody).ConfigureAwait(false);
+            await handler(envelope, body, headers, cancellationToken).ConfigureAwait(false);
+            await AckAsync(reserved).ConfigureAwait(false);
         }
 #pragma warning disable CA1031 // The consume loop must survive any handler exception.
         catch (Exception error)
 #pragma warning restore CA1031
         {
             // Leave the element on the processing list — it stays reserved for a later sweep/retry.
-            _options.OnError?.Invoke(error, envelope, rawBody);
+            _options.OnError?.Invoke(error, envelope, body);
         }
     }
 
-    /// <summary>Ack: remove the reserved element from the processing list (LREM, count 1).</summary>
-    private async Task AckAsync(string rawBody)
-        => await _database.ListRemoveAsync(_processing, rawBody, 1).ConfigureAwait(false);
+    /// <summary>
+    /// Ack: remove the reserved element from the processing list (LREM, count 1). The handle is the
+    /// raw stored value (frame or bare), so the LREM matches what was RPUSHed.
+    /// </summary>
+    private async Task AckAsync(string reserved)
+        => await _database.ListRemoveAsync(_processing, reserved, 1).ConfigureAwait(false);
 }

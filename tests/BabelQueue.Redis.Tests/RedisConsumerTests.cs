@@ -39,7 +39,7 @@ public sealed class RedisConsumerTests
 
         var handlers = new Dictionary<string, BabelHandler>
         {
-            ["urn:babel:orders:created"] = (env, raw, _) => { seen = env; rawSeen = raw; return Task.CompletedTask; },
+            ["urn:babel:orders:created"] = (env, raw, _, _) => { seen = env; rawSeen = raw; return Task.CompletedTask; },
         };
         var processed = await new RedisConsumer(mock.Object, Queue, handlers).PollAsync();
 
@@ -55,7 +55,7 @@ public sealed class RedisConsumerTests
         var mock = MockReserving(Envelope());
         var handlers = new Dictionary<string, BabelHandler>
         {
-            ["urn:babel:orders:created"] = (_, _, _) => Task.CompletedTask,
+            ["urn:babel:orders:created"] = (_, _, _, _) => Task.CompletedTask,
         };
 
         await new RedisConsumer(mock.Object, Queue, handlers).PollAsync();
@@ -71,7 +71,7 @@ public sealed class RedisConsumerTests
         var attempts = -1;
         var handlers = new Dictionary<string, BabelHandler>
         {
-            ["urn:babel:orders:created"] = (env, _, _) => { attempts = env.Attempts; return Task.CompletedTask; },
+            ["urn:babel:orders:created"] = (env, _, _, _) => { attempts = env.Attempts; return Task.CompletedTask; },
         };
 
         await new RedisConsumer(mock.Object, Queue, handlers).PollAsync();
@@ -86,7 +86,7 @@ public sealed class RedisConsumerTests
         Exception? captured = null;
         var handlers = new Dictionary<string, BabelHandler>
         {
-            ["urn:babel:orders:created"] = (_, _, _) => throw new InvalidOperationException("boom"),
+            ["urn:babel:orders:created"] = (_, _, _, _) => throw new InvalidOperationException("boom"),
         };
         var options = new RedisConsumerOptions { OnError = (e, _, _) => captured = e };
 
@@ -135,7 +135,7 @@ public sealed class RedisConsumerTests
         var count = 0;
         var handlers = new Dictionary<string, BabelHandler>
         {
-            ["urn:babel:orders:created"] = (_, _, _) => { count++; return Task.CompletedTask; },
+            ["urn:babel:orders:created"] = (_, _, _, _) => { count++; return Task.CompletedTask; },
         };
         var options = new RedisConsumerOptions { MaxMessages = 2 };
 
@@ -167,7 +167,7 @@ public sealed class RedisConsumerTests
 
         var handlers = new Dictionary<string, BabelHandler>
         {
-            ["urn:babel:orders:created"] = (_, _, _) => Task.CompletedTask,
+            ["urn:babel:orders:created"] = (_, _, _, _) => Task.CompletedTask,
         };
         var options = new RedisConsumerOptions { ProcessingSuffix = ":inflight" };
         var consumer = new RedisConsumer(mock.Object, Queue, handlers, options);
@@ -204,7 +204,7 @@ public sealed class RedisConsumerTests
         var handled = 0;
         var handlers = new Dictionary<string, BabelHandler>
         {
-            ["urn:babel:orders:created"] = (_, _, _) => { handled++; return Task.CompletedTask; },
+            ["urn:babel:orders:created"] = (_, _, _, _) => { handled++; return Task.CompletedTask; },
         };
         // Tiny idle delay; cancel as soon as the idle delay is entered.
         var options = new RedisConsumerOptions { IdleDelay = TimeSpan.FromMilliseconds(10) };
