@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-21
+
 ### Added
 - **OTel `traceparent` propagation (ADR-0028).** `RedisPublisher.PublishWithHeadersAsync(urn, data,
   headers, traceId)` carries an out-of-band header carrier (e.g. a W3C `traceparent` from
@@ -47,5 +49,6 @@ The envelope wire format is versioned separately by `meta.schema_version`
   `IDatabase` (no Redis, no network). The envelope is unchanged
   (`schema_version: 1`); Redis support is purely additive.
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-dotnet-redis/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/babelqueue-dotnet-redis/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/BabelQueue/babelqueue-dotnet-redis/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/BabelQueue/babelqueue-dotnet-redis/releases/tag/v1.0.0
