@@ -27,6 +27,7 @@
   <ItemGroup>
     <!-- Vendored canonical conformance suite (synced from conformance/); copied next to the test assembly. -->
     <None Include="conformance/**/*.json" CopyToOutputDirectory="PreserveNewest" LinkBase="conformance" />
+    <None Include="conformance/CONFORMANCE_VERSION" CopyToOutputDirectory="PreserveNewest" LinkBase="conformance" />
   </ItemGroup>
 
 </Project>

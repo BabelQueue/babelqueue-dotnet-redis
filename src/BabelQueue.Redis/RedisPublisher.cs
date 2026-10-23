@@ -10,20 +10,65 @@ namespace BabelQueue.Redis;
 /// no wrapping and no added fields (contract §1.2, conformance <c>redis.payload_identity</c>).
 /// A Go/Python/... consumer pops and decodes that same body. The envelope is
 /// unchanged (<c>schema_version</c> stays 1); Redis support is purely additive.
+/// With <see cref="RedisLayout.Zset"/> the publisher speaks Laravel's layout (<c>RPUSH queues:&lt;name&gt;</c> +
+/// a <c>:notify</c> token, delayed publishes on <c>:delayed</c>); headers are not carried there.
 /// </summary>
 public sealed class RedisPublisher
 {
-    private readonly IDatabase _database;
+    private readonly RedisQueue _engine;
     private readonly string _queue;
 
     /// <param name="database">The StackExchange.Redis database (<see cref="IDatabase"/> — mockable in tests).</param>
     /// <param name="queue">The Redis list key messages are appended to (the logical queue name).</param>
     public RedisPublisher(IDatabase database, string queue)
+        : this(database, queue, new RedisPublisherOptions())
+    {
+    }
+
+    /// <param name="database">The StackExchange.Redis database.</param>
+    /// <param name="queue">The logical queue name.</param>
+    /// <param name="options">Layout selection (<see cref="RedisLayout.Zset"/> publishes to a Laravel-style queue).</param>
+    public RedisPublisher(IDatabase database, string queue, RedisPublisherOptions options)
+        : this(database, queue, options, clock: null)
+    {
+    }
+
+    internal RedisPublisher(IDatabase database, string queue, RedisPublisherOptions options, Func<double>? clock)
     {
         ArgumentNullException.ThrowIfNull(database);
         ArgumentException.ThrowIfNullOrEmpty(queue);
-        _database = database;
+        ArgumentNullException.ThrowIfNull(options);
         _queue = queue;
+        _engine = new RedisQueue(
+            database,
+            queue,
+            options.Layout,
+            options.KeyPrefix,
+            processingSuffix: ":processing",
+            retryAfter: null,
+            migrationBatchSize: -1,
+            clock ?? RedisConsumer.ClockOf(options.Clock));
+    }
+
+    /// <summary>The ready list key messages are appended to.</summary>
+    public string ReadyKey => _engine.Ready;
+
+    /// <summary>
+    /// Zset layout only: publishes <c>(urn, data)</c> to be delivered after <paramref name="delay"/>
+    /// (<c>ZADD :delayed floor(now)+ceil(delay)</c>, no notify token — §1.6). Returns <c>meta.id</c>.
+    /// </summary>
+    /// <exception cref="NotSupportedException">The legacy layout has no delayed set.</exception>
+    public async Task<string> PublishDelayedAsync(
+        string urn,
+        IReadOnlyDictionary<string, object?>? data,
+        TimeSpan delay,
+        string? traceId = null,
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var envelope = EnvelopeCodec.Make(urn, data, _queue, traceId);
+        await _engine.PushDelayedAsync(EnvelopeCodec.Encode(envelope), delay).ConfigureAwait(false);
+        return envelope.Meta?.Id ?? string.Empty;
     }
 
     /// <summary>
@@ -67,8 +112,10 @@ public sealed class RedisPublisher
 
         // Bare: the list element IS the envelope JSON byte-for-byte (§1.2). Framed (headers present):
         // the headers ride in a transport-owned frame beside the frozen envelope (ADR-0028).
-        var value = RedisFrame.FrameValue(EnvelopeCodec.Encode(envelope), headers);
-        await _database.ListRightPushAsync(_queue, value).ConfigureAwait(false);
+        // The zset layout forbids the frame key, so headers are dropped there (traceparent is not carried).
+        var body = EnvelopeCodec.Encode(envelope);
+        var value = _engine.Layout == RedisLayout.Zset ? body : RedisFrame.FrameValue(body, headers);
+        await _engine.PushAsync(value).ConfigureAwait(false);
 
         return envelope.Meta?.Id ?? string.Empty;
     }

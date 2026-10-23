@@ -9,6 +9,37 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+
+- **Zset layout (opt-in):** `RedisLayout.Zset` on `RedisConsumerOptions.Layout` / `RedisPublisherOptions.Layout` speaks Laravel's sorted-set queue (`queues:<name>`, `:delayed`, `:reserved`, `:notify`) with Laravel's Lua pop / release / migrate scripts (ADR-0034 §1). Options: `KeyPrefix`, `RetryAfter`, `MigrationBatchSize`. `RedisPublisher.PublishDelayedAsync` (zset only) parks a message on `:delayed`.
+- `RedisConsumerOptions.OnHandlerFailure` (`RedisFailureAction.Leave` | `Release`) and `ReleaseDelay`: opt-in immediate release of a message whose handler threw (default `Leave`, behaviour unchanged).
+- Legacy layout: a deadline sweep (`<queue>:processing:deadlines`) returns an expired reservation to the ready list byte for byte, so a crashed worker's message is no longer stranded. The default `:processing` mode and `ProcessingSuffix` are unchanged.
+- CI runs a `redis:7` service with `BQ_REQUIRE_REDIS=1` (the `redis_layout` behavioural cases and the Lua integration tests must not skip) in `ci.yml` and `release.yml`.
+
+### Fixed
+
+- `RedisConsumerOptions.IdleDelay` is clamped to 1 s (`RedisConsumerOptions.MaxIdleDelay`), the ADR-0033 section 10 cap; negative values become zero.
+- The conformance test project did not copy `conformance/CONFORMANCE_VERSION` to its output directory, so the live `results.json` run (`RedisConformanceSuite`) would have thrown `FileNotFoundException` on a runner with Redis.
+- `release.yml` now writes `results.json` (`BQ_CONFORMANCE_RESULTS`) and attaches it to the GitHub release (ADR-0032).
+
+### Docs
+
+- README: a non-conformant envelope or an unmapped URN without `OnUnknownUrn` is only reported to `OnError` and redelivered every `retry_after` (zset `attempts` grows unbounded). Unchanged behaviour, now documented.
+
+- README: zset reservations are keyed by the job body, so byte-identical elements (notably identical poison copies handled concurrently) share one `:reserved` member and only one reaches the DLQ (ADR-0033 section 3 contract limit).
+
+### Tests
+
+- Live tests: late ack leaves the redelivered copy alone and the third worker cleans up; identical zset copies collapse into one reservation member (asserted outside the handler, `OnError` empty); identical poison copies: only one DLQ move wins; a `RetryAfter = null` consumer still sweeps a foreign expired member and then reserves it (broker-bindings section 1.7); null-mode acks raise no `OnWarning`; the release test compares against a literal expected body (not `RedisReleaseBody.Build`).
+
+### Limits
+
+- On the zset layout the `__bq_frame` key is forbidden, so header frames are dropped and `traceparent` is not carried (A3). On Redis Cluster the queue name needs a hash tag (`{orders}`).
+
+### Changed
+
+- Vendored conformance suite updated to v1.6.0; CI pins the `fetch.sh` it downloads by sha256 (`BQ_FETCH_SH_SHA256`).
+
 ## [1.1.0] - 2026-06-21
 
 ### Added

@@ -1,27 +1,29 @@
+using System.Text.RegularExpressions;
 using BabelQueue;
 using BabelQueue.Redis;
-using Moq;
 using StackExchange.Redis;
 using Xunit;
 
 namespace BabelQueue.Redis.Tests;
 
+/// <summary>Legacy (<c>:processing</c>) layout consumer behaviour over a scripted database.</summary>
 public sealed class RedisConsumerTests
 {
     private const string Queue = "orders";
     private const string Processing = "orders:processing";
+    private const string Deadlines = "orders:processing:deadlines";
+    private const double Now = 1000.7;
 
-    /// <summary>A database that yields the given bodies once each (then drains), tracking LREM acks.</summary>
-    private static Mock<IDatabase> MockReserving(params string[] bodies)
-    {
-        var queue = new Queue<string>(bodies);
-        var mock = new Mock<IDatabase>();
-        mock.Setup(d => d.ListMoveAsync(Queue, Processing, ListSide.Left, ListSide.Right, It.IsAny<CommandFlags>()))
-            .ReturnsAsync(() => queue.Count > 0 ? queue.Dequeue() : RedisValue.Null);
-        mock.Setup(d => d.ListRemoveAsync(Processing, It.IsAny<RedisValue>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
-            .ReturnsAsync(1L);
-        return mock;
-    }
+    private static Func<double> Clock => () => Now;
+
+    /// <summary>A database that yields the given bodies once each from the reserve script (then drains); acks succeed.</summary>
+    private static ScriptDb Reserving(params string[] bodies)
+        => new ScriptDb()
+            .Queue(RedisScripts.LegacyReserve, bodies.Select(ScriptDb.Text).ToArray())
+            .On(RedisScripts.LegacyAck, _ => ScriptDb.Integer(1))
+            .On(RedisScripts.LegacyRelease, _ => ScriptDb.Integer(1))
+            .On(RedisScripts.LegacyDeadLetter, _ => ScriptDb.Integer(1))
+            .On(RedisScripts.LegacySweep, _ => ScriptDb.Integer(0));
 
     private static string Envelope(int attempts = 0)
     {
@@ -29,117 +31,185 @@ public sealed class RedisConsumerTests
         return EnvelopeCodec.Encode(env with { Attempts = attempts });
     }
 
+    private static Dictionary<string, BabelHandler> Handlers(BabelHandler handler)
+        => new() { ["urn:babel:orders:created"] = handler };
+
+    private static RedisConsumer Consumer(ScriptDb db, Dictionary<string, BabelHandler>? handlers = null, RedisConsumerOptions? options = null)
+        => new(db.Object, Queue, handlers ?? new Dictionary<string, BabelHandler>(), options, Clock);
+
     [Fact]
-    public async Task RoutesValidMessageThenAcks()
+    public async Task RoutesValidMessageThenAcksBehindTheTokenGate()
     {
         var body = Envelope();
-        var mock = MockReserving(body);
+        var db = Reserving(body);
         Envelope? seen = null;
         string? rawSeen = null;
 
-        var handlers = new Dictionary<string, BabelHandler>
-        {
-            ["urn:babel:orders:created"] = (env, raw, _, _) => { seen = env; rawSeen = raw; return Task.CompletedTask; },
-        };
-        var processed = await new RedisConsumer(mock.Object, Queue, handlers).PollAsync();
+        var processed = await Consumer(db, Handlers((env, raw, _, _) => { seen = env; rawSeen = raw; return Task.CompletedTask; })).PollAsync();
 
         Assert.Equal(1, processed);
         Assert.Equal("urn:babel:orders:created", seen!.Job);
         Assert.Equal(body, rawSeen);
-        mock.Verify(d => d.ListRemoveAsync(Processing, body, 1, It.IsAny<CommandFlags>()), Times.Once);
+
+        var reserve = db.Of(RedisScripts.LegacyReserve)[0];
+        var ack = Assert.Single(db.Of(RedisScripts.LegacyAck));
+        Assert.Equal(new[] { Processing, Deadlines }, ack.Keys);
+        Assert.Equal(body, (string)ack.Values[1]!);
+        // The token that scored the deadline member is the token the ack presents.
+        Assert.Equal((string)reserve.Values[1]!, (string)ack.Values[0]!);
     }
 
     [Fact]
-    public async Task ReservesViaLeftToRightMove()
+    public async Task SweepRunsBeforeEveryReserve()
     {
-        var mock = MockReserving(Envelope());
-        var handlers = new Dictionary<string, BabelHandler>
-        {
-            ["urn:babel:orders:created"] = (_, _, _, _) => Task.CompletedTask,
-        };
+        var db = Reserving(Envelope(), Envelope());
+        await Consumer(db, Handlers((_, _, _, _) => Task.CompletedTask)).PollAsync();
 
-        await new RedisConsumer(mock.Object, Queue, handlers).PollAsync();
+        var order = db.Calls.Select(c => c.Script).Where(s => s is RedisScripts.LegacySweep or RedisScripts.LegacyReserve).ToList();
+        Assert.Equal(
+            new[]
+            {
+                RedisScripts.LegacySweep, RedisScripts.LegacyReserve,
+                RedisScripts.LegacySweep, RedisScripts.LegacyReserve,
+                RedisScripts.LegacySweep, RedisScripts.LegacyReserve,
+            },
+            order);
+    }
 
-        // Reliable-queue reserve: LMOVE <queue> <queue>:processing LEFT RIGHT (matches the Go reference).
-        mock.Verify(d => d.ListMoveAsync(Queue, Processing, ListSide.Left, ListSide.Right, It.IsAny<CommandFlags>()), Times.AtLeastOnce);
+    [Fact]
+    public async Task ReserveKeysAndDeadlineScoreFollowTheClock()
+    {
+        var db = Reserving(Envelope());
+        await Consumer(db, Handlers((_, _, _, _) => Task.CompletedTask)).PollAsync();
+
+        var reserve = db.Of(RedisScripts.LegacyReserve)[0];
+        Assert.Equal(new[] { Queue, Processing, Deadlines }, reserve.Keys);
+        // floor(1000.7) + 90 s default retry_after
+        Assert.Equal("1090", (string)reserve.Values[0]!);
+        var sweep = db.Of(RedisScripts.LegacySweep)[0];
+        Assert.Equal(new[] { Queue, Processing, Deadlines }, sweep.Keys);
+        Assert.Equal("1000", (string)sweep.Values[0]!);
+    }
+
+    [Fact]
+    public async Task NullRetryAfterScoresPositiveInfinity()
+    {
+        var db = Reserving(Envelope());
+        var options = new RedisConsumerOptions { RetryAfter = null };
+        await Consumer(db, Handlers((_, _, _, _) => Task.CompletedTask), options).PollAsync();
+
+        Assert.Equal("+inf", (string)db.Of(RedisScripts.LegacyReserve)[0].Values[0]!);
+    }
+
+    [Fact]
+    public async Task TokenIs32LowercaseHexAndFreshPerReservation()
+    {
+        var db = Reserving(Envelope(), Envelope(), Envelope());
+        await Consumer(db, Handlers((_, _, _, _) => Task.CompletedTask)).PollAsync();
+
+        var tokens = db.Of(RedisScripts.LegacyReserve).Select(c => (string)c.Values[1]!).ToList();
+        Assert.Equal(4, tokens.Count);
+        Assert.All(tokens, t => Assert.Matches("^[0-9a-f]{32}$", t));
+        Assert.Equal(tokens.Count, tokens.Distinct().Count());
+    }
+
+    [Fact]
+    public void NegativeRetryAfterIsAConfigurationError()
+    {
+        var options = new RedisConsumerOptions { RetryAfter = TimeSpan.FromSeconds(-1) };
+        Assert.Throws<ArgumentOutOfRangeException>(() => Consumer(Reserving(), null, options));
     }
 
     [Fact]
     public async Task PreservesAttemptsFromBody()
     {
-        var mock = MockReserving(Envelope(attempts: 4));
+        var db = Reserving(Envelope(attempts: 4));
         var attempts = -1;
-        var handlers = new Dictionary<string, BabelHandler>
-        {
-            ["urn:babel:orders:created"] = (env, _, _, _) => { attempts = env.Attempts; return Task.CompletedTask; },
-        };
+        await Consumer(db, Handlers((env, _, _, _) => { attempts = env.Attempts; return Task.CompletedTask; })).PollAsync();
 
-        await new RedisConsumer(mock.Object, Queue, handlers).PollAsync();
-
+        // Legacy never increments attempts.
         Assert.Equal(4, attempts);
     }
 
     [Fact]
     public async Task ThrowingHandlerLeavesReservedAndReportsOnError()
     {
-        var mock = MockReserving(Envelope());
+        var db = Reserving(Envelope());
         Exception? captured = null;
-        var handlers = new Dictionary<string, BabelHandler>
-        {
-            ["urn:babel:orders:created"] = (_, _, _, _) => throw new InvalidOperationException("boom"),
-        };
         var options = new RedisConsumerOptions { OnError = (e, _, _) => captured = e };
 
-        await new RedisConsumer(mock.Object, Queue, handlers, options).PollAsync();
+        await Consumer(db, Handlers((_, _, _, _) => throw new InvalidOperationException("boom")), options).PollAsync();
 
         Assert.IsType<InvalidOperationException>(captured);
-        // Not acked: the element stays on the processing list for a later sweep/retry.
-        mock.Verify(d => d.ListRemoveAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<long>(), It.IsAny<CommandFlags>()), Times.Never);
+        Assert.Empty(db.Of(RedisScripts.LegacyAck));
+        Assert.Empty(db.Of(RedisScripts.LegacyRelease));
+    }
+
+    [Fact]
+    public async Task ReleaseOnFailureReturnsTheMessageToReady()
+    {
+        var db = Reserving(Envelope());
+        var options = new RedisConsumerOptions { OnHandlerFailure = RedisFailureAction.Release };
+
+        await Consumer(db, Handlers((_, _, _, _) => throw new InvalidOperationException("boom")), options).PollAsync();
+
+        var release = Assert.Single(db.Of(RedisScripts.LegacyRelease));
+        Assert.Equal(new[] { Processing, Deadlines, Queue }, release.Keys);
+        Assert.Empty(db.Of(RedisScripts.LegacyAck));
     }
 
     [Fact]
     public async Task NonConformantEnvelopeReportsOnErrorAndLeavesReserved()
     {
-        var mock = MockReserving("{\"not\":\"an envelope\"}");
+        var db = Reserving("{\"not\":\"an envelope\"}");
         Exception? captured = null;
         var options = new RedisConsumerOptions { OnError = (e, _, _) => captured = e };
 
-        await new RedisConsumer(mock.Object, Queue, new Dictionary<string, BabelHandler>(), options).PollAsync();
+        await Consumer(db, null, options).PollAsync();
 
         Assert.IsType<BabelQueueException>(captured);
-        mock.Verify(d => d.ListRemoveAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<long>(), It.IsAny<CommandFlags>()), Times.Never);
+        Assert.Empty(db.Of(RedisScripts.LegacyAck));
     }
 
     [Fact]
     public async Task UnknownUrnWithHookAcksAndReportsWithoutHook()
     {
-        var withHook = MockReserving(Envelope());
+        var withHook = Reserving(Envelope());
         string? unknown = null;
         var optionsA = new RedisConsumerOptions { OnUnknownUrn = (env, _, _) => { unknown = EnvelopeCodec.Urn(env); return Task.CompletedTask; } };
-        await new RedisConsumer(withHook.Object, Queue, new Dictionary<string, BabelHandler>(), optionsA).PollAsync();
+        await Consumer(withHook, null, optionsA).PollAsync();
         Assert.Equal("urn:babel:orders:created", unknown);
-        withHook.Verify(d => d.ListRemoveAsync(Processing, It.IsAny<RedisValue>(), 1, It.IsAny<CommandFlags>()), Times.Once);
+        Assert.Single(withHook.Of(RedisScripts.LegacyAck));
 
-        var noHook = MockReserving(Envelope());
+        var noHook = Reserving(Envelope());
         Exception? captured = null;
         var optionsB = new RedisConsumerOptions { OnError = (e, _, _) => captured = e };
-        await new RedisConsumer(noHook.Object, Queue, new Dictionary<string, BabelHandler>(), optionsB).PollAsync();
+        await Consumer(noHook, null, optionsB).PollAsync();
         Assert.IsType<UnknownUrnException>(captured);
-        noHook.Verify(d => d.ListRemoveAsync(It.IsAny<RedisKey>(), It.IsAny<RedisValue>(), It.IsAny<long>(), It.IsAny<CommandFlags>()), Times.Never);
+        Assert.Empty(noHook.Of(RedisScripts.LegacyAck));
+    }
+
+    [Fact]
+    public async Task LateAckTouchesNothingAndWarns()
+    {
+        var db = Reserving(Envelope()).On(RedisScripts.LegacyAck, _ => ScriptDb.Integer(0));
+        var warnings = new List<string>();
+        var options = new RedisConsumerOptions { OnWarning = warnings.Add };
+
+        var processed = await Consumer(db, Handlers((_, _, _, _) => Task.CompletedTask), options).PollAsync();
+
+        Assert.Equal(1, processed);
+        Assert.Equal(new[] { "reservation expired" }, warnings);
     }
 
     [Fact]
     public async Task PollReservesUpToMaxMessages()
     {
-        var mock = MockReserving(Envelope(), Envelope(), Envelope());
+        var db = Reserving(Envelope(), Envelope(), Envelope());
         var count = 0;
-        var handlers = new Dictionary<string, BabelHandler>
-        {
-            ["urn:babel:orders:created"] = (_, _, _, _) => { count++; return Task.CompletedTask; },
-        };
         var options = new RedisConsumerOptions { MaxMessages = 2 };
 
-        var processed = await new RedisConsumer(mock.Object, Queue, handlers, options).PollAsync();
+        var processed = await Consumer(db, Handlers((_, _, _, _) => { count++; return Task.CompletedTask; }), options).PollAsync();
 
         Assert.Equal(2, processed);
         Assert.Equal(2, count);
@@ -148,71 +218,109 @@ public sealed class RedisConsumerTests
     [Fact]
     public async Task EmptyPollReturnsZero()
     {
-        var mock = MockReserving();
-        var processed = await new RedisConsumer(mock.Object, Queue, new Dictionary<string, BabelHandler>()).PollAsync();
+        var processed = await Consumer(Reserving()).PollAsync();
         Assert.Equal(0, processed);
     }
 
     [Fact]
     public async Task CustomProcessingSuffixIsUsed()
     {
-        const string customProcessing = "orders:inflight";
-        var body = Envelope();
-        var queue = new Queue<string>(new[] { body });
-        var mock = new Mock<IDatabase>();
-        mock.Setup(d => d.ListMoveAsync(Queue, customProcessing, ListSide.Left, ListSide.Right, It.IsAny<CommandFlags>()))
-            .ReturnsAsync(() => queue.Count > 0 ? queue.Dequeue() : RedisValue.Null);
-        mock.Setup(d => d.ListRemoveAsync(customProcessing, It.IsAny<RedisValue>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
-            .ReturnsAsync(1L);
-
-        var handlers = new Dictionary<string, BabelHandler>
-        {
-            ["urn:babel:orders:created"] = (_, _, _, _) => Task.CompletedTask,
-        };
+        var db = Reserving(Envelope());
         var options = new RedisConsumerOptions { ProcessingSuffix = ":inflight" };
-        var consumer = new RedisConsumer(mock.Object, Queue, handlers, options);
+        var consumer = Consumer(db, Handlers((_, _, _, _) => Task.CompletedTask), options);
 
-        Assert.Equal(customProcessing, consumer.ProcessingKey);
+        Assert.Equal("orders:inflight", consumer.ProcessingKey);
         await consumer.PollAsync();
-        mock.Verify(d => d.ListRemoveAsync(customProcessing, body, 1, It.IsAny<CommandFlags>()), Times.Once);
+        Assert.Equal(new[] { Queue, "orders:inflight", "orders:inflight:deadlines" }, db.Of(RedisScripts.LegacyReserve)[0].Keys);
+    }
+
+    [Fact]
+    public void KeyAccessorsReflectTheLegacyLayout()
+    {
+        var consumer = Consumer(Reserving());
+        Assert.Equal(Queue, consumer.ReadyKey);
+        Assert.Equal(Processing, consumer.ProcessingKey);
+        Assert.Equal("orders.dlq", consumer.DeadLetterKey);
+        Assert.Equal(string.Empty, consumer.ReservedKey);
     }
 
     [Fact]
     public async Task RunStopsWhenCancelled()
     {
-        var mock = MockReserving();
+        var db = Reserving();
         using var cts = new CancellationTokenSource();
         await cts.CancelAsync();
 
-        await new RedisConsumer(mock.Object, Queue, new Dictionary<string, BabelHandler>()).RunAsync(cts.Token);
+        await Consumer(db).RunAsync(cts.Token);
 
-        mock.Verify(d => d.ListMoveAsync(It.IsAny<RedisKey>(), It.IsAny<RedisKey>(), It.IsAny<ListSide>(), It.IsAny<ListSide>(), It.IsAny<CommandFlags>()), Times.Never);
+        Assert.Empty(db.Calls);
     }
 
     [Fact]
     public async Task RunProcessesThenStopsOnCancellationAfterIdle()
     {
-        // One message available, then empty; cancel via the idle delay so RunAsync exits.
         using var cts = new CancellationTokenSource();
-        var queue = new Queue<string>(new[] { Envelope() });
-        var mock = new Mock<IDatabase>();
-        mock.Setup(d => d.ListMoveAsync(Queue, Processing, ListSide.Left, ListSide.Right, It.IsAny<CommandFlags>()))
-            .ReturnsAsync(() => queue.Count > 0 ? queue.Dequeue() : RedisValue.Null);
-        mock.Setup(d => d.ListRemoveAsync(Processing, It.IsAny<RedisValue>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
-            .ReturnsAsync(1L);
-
+        var db = Reserving(Envelope());
         var handled = 0;
-        var handlers = new Dictionary<string, BabelHandler>
-        {
-            ["urn:babel:orders:created"] = (_, _, _, _) => { handled++; return Task.CompletedTask; },
-        };
-        // Tiny idle delay; cancel as soon as the idle delay is entered.
         var options = new RedisConsumerOptions { IdleDelay = TimeSpan.FromMilliseconds(10) };
 
-        var run = new RedisConsumer(mock.Object, Queue, handlers, options).RunAsync(cts.Token);
+        var run = Consumer(db, Handlers((_, _, _, _) => { handled++; return Task.CompletedTask; }), options).RunAsync(cts.Token);
         await cts.CancelAsync();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
 
         Assert.Equal(1, handled);
     }
+
+    [Fact]
+    public void IdleDelayIsClampedToTheOneSecondCapOfAdr0033()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(1), new RedisConsumerOptions().IdleDelay);
+        Assert.Equal(TimeSpan.FromSeconds(1), new RedisConsumerOptions { IdleDelay = TimeSpan.FromSeconds(30) }.IdleDelay);
+        Assert.Equal(TimeSpan.FromMilliseconds(250), new RedisConsumerOptions { IdleDelay = TimeSpan.FromMilliseconds(250) }.IdleDelay);
+        Assert.Equal(TimeSpan.Zero, new RedisConsumerOptions { IdleDelay = TimeSpan.FromSeconds(-5) }.IdleDelay);
+        Assert.Equal(TimeSpan.FromSeconds(1), RedisConsumerOptions.MaxIdleDelay);
+    }
+
+    [Fact]
+    public async Task IdleBackoffDoublesFromOneHundredMillisecondsAndResetsOnMessage()
+    {
+        // Empty, empty, then a message, then empty again: just proves the loop keeps polling and exits on cancel.
+        using var cts = new CancellationTokenSource();
+        var polls = 0;
+        var db = new ScriptDb()
+            .On(RedisScripts.LegacySweep, _ => ScriptDb.Integer(0))
+            .On(RedisScripts.LegacyReserve, _ => { if (++polls >= 3) { cts.Cancel(); } return ScriptDb.Nil(); });
+        var options = new RedisConsumerOptions { IdleDelay = TimeSpan.FromMilliseconds(250) };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => Consumer(db, null, options).RunAsync(cts.Token));
+
+        Assert.True(polls >= 3);
+    }
+
+    [Fact]
+    public void TokenSourceUsesOnlyTheCsprng()
+    {
+        var source = File.ReadAllText(Path.Combine(RepoRoot(), "src", "BabelQueue.Redis", "RedisQueue.cs"));
+        Assert.Contains("RandomNumberGenerator", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("System.Random", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("new Random", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("Random.Shared", source, StringComparison.Ordinal);
+        Assert.Matches(new Regex("^[0-9a-f]{32}$"), RedisQueueAccess.NewToken());
+    }
+
+    internal static string RepoRoot()
+    {
+        var dir = new DirectoryInfo(AppContext.BaseDirectory);
+        while (dir is not null && !File.Exists(Path.Combine(dir.FullName, "BabelQueue.Redis.sln")) && !Directory.Exists(Path.Combine(dir.FullName, "src")))
+        {
+            dir = dir.Parent;
+        }
+
+        return dir?.FullName ?? throw new InvalidOperationException("repository root not found");
+    }
+}
+
+internal static class RedisQueueAccess
+{
+    internal static string NewToken() => RedisQueue.NewToken();
 }

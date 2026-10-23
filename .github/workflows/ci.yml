@@ -11,6 +11,21 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A real Redis: the Lua scripts and the redis_layout behavioural conformance blocks run for
+    # real (BQ_REQUIRE_REDIS makes an unreachable broker fail the run instead of skipping).
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      REDIS_URL: redis://localhost:6379/0
+      BQ_REQUIRE_REDIS: "1"
     steps:
       - uses: actions/checkout@v5
 
@@ -26,22 +41,36 @@ jobs:
       - name: Build (static analysis)
         run: dotnet build -c Release --no-restore
 
-      # The xUnit suite (incl. the Redis binding conformance test) runs against a
-      # Moq-mocked IDatabase — no Redis, no network.
+      # The xUnit suite runs against the Moq-mocked IDatabase (which scripts are called) AND the redis:7
+      # service (what they do): zero skips are expected, and the conformance runner writes results.json.
       - name: Test with coverage gate (>=90% line)
+        env:
+          BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
         run: dotnet test -c Release /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura /p:Threshold=90 /p:ThresholdType=line /p:ThresholdStat=total
+
+      - name: Upload conformance results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-results
+          path: ${{ runner.temp }}/results.json
+          if-no-files-found: warn
 
   conformance:
     name: Conformance suite in sync
     runs-on: ubuntu-latest
     env:
-      BQ_CONFORMANCE_VERSION: 1.5.0
+      BQ_CONFORMANCE_VERSION: 1.6.0
+      # sha256 of that release's fetch.sh: the script runs on the runner, so it is pinned rather
+      # than trusted from a mutable tag. Bump together with BQ_CONFORMANCE_VERSION.
+      BQ_FETCH_SH_SHA256: 8bb6ba567b288fb0ac71a70fd17041b2503df119e01998d76fdad372570bf849
     steps:
       - uses: actions/checkout@v5
       - name: Verify vendored conformance matches the pinned release asset
         run: |
           curl --fail --silent --show-error --location --output "$RUNNER_TEMP/fetch.sh" \
             "https://raw.githubusercontent.com/BabelQueue/conformance/v${BQ_CONFORMANCE_VERSION}/fetch.sh"
+          echo "${BQ_FETCH_SH_SHA256}  $RUNNER_TEMP/fetch.sh" | sha256sum -c -
           bash "$RUNNER_TEMP/fetch.sh" --check "$BQ_CONFORMANCE_VERSION" "tests/BabelQueue.Redis.Tests/conformance"
 
   ci-green:

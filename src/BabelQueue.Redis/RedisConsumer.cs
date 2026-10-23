@@ -3,28 +3,38 @@ using StackExchange.Redis;
 namespace BabelQueue.Redis;
 
 /// <summary>
-/// Drains a Redis list with the reliable-queue pattern (broker-bindings §1, mirroring the
-/// Go reference): each message is <b>reserved</b> by atomically moving the head of the queue
-/// onto a per-queue <c>&lt;queue&gt;:processing</c> list (<c>LMOVE LEFT RIGHT</c>), so an
-/// in-flight message survives a worker crash; it is then decoded, validated, routed to the
-/// handler registered for its URN, and <b>acked</b> by removing it from the processing list
-/// (<c>LREM</c>) on success. A throwing handler leaves the reserved element on the processing
-/// list (at-least-once); the poll loop never stops on a bad message — observe via the option
-/// hooks. The list element is the canonical envelope JSON verbatim — there is no native
-/// metadata and no projection (§1.2), so routing always decodes the body.
+/// Drains one Redis queue with a crash-safe reservation (broker-bindings §1, ADR-0033), then decodes,
+/// validates, routes each message to the handler registered for its URN and acks it on success.
 /// </summary>
 /// <remarks>
-/// This is a <b>.NET-owned reliable queue</b>: produce/reserve/ack are self-consistent and
-/// crash-safe on a queue this SDK owns end-to-end. Full parity with Laravel's
-/// reserved-sorted-set reservation on a <i>shared</i> PHP+.NET Redis queue
-/// (<c>queues:&lt;name&gt;:reserved</c> scored by <c>retry_after</c>, attempts incremented by
-/// the reservation Lua script) is a separate task — see broker-bindings §1.4.
+/// <para>
+/// <b>Legacy layout</b> (<see cref="RedisLayout.Legacy"/>, the default, key names unchanged): the head of
+/// <c>&lt;queue&gt;</c> is moved onto <c>&lt;queue&gt;:processing</c> and a deadline member
+/// <c>&lt;token&gt;:&lt;raw&gt;</c> (128-bit CSPRNG token, 32 lowercase hex) is scored
+/// <c>floor(now) + retry_after</c> on <c>&lt;queue&gt;:processing:deadlines</c>. Before every reserve a sweep
+/// returns expired reservations to the ready list byte for byte (attempts not incremented), so a crashed
+/// worker's message is not stranded. Ack / release / dead-letter act only while the deadline member still
+/// exists; a late ack on an expired reservation touches nothing and raises a "reservation expired" warning.
+/// </para>
+/// <para>
+/// <b>Zset layout</b> (<see cref="RedisLayout.Zset"/>, opt-in): Laravel's sorted-set layout
+/// (<c>queues:&lt;name&gt;</c>, <c>:delayed</c>, <c>:reserved</c>, <c>:notify</c>). Every reserve first migrates
+/// due <c>:delayed</c> and <c>:reserved</c> members, then runs Laravel's pop script (attempts + 1, deadline
+/// <c>floor(now) + retry_after</c>). An element the script cannot parse is dead-lettered as poison. A handler
+/// that throws leaves the message reserved (default) or releases it (<see cref="RedisFailureAction.Release"/>).
+/// Header frames are not carried on this layout (the <c>__bq_frame</c> key is forbidden there).
+/// </para>
+/// <para>
+/// The loop never stops on a bad message — observe it via the option hooks. A handler that keeps failing on a
+/// message that is released or recovered will redeliver it indefinitely; bound it with the handler or move it
+/// aside with <see cref="RedisConsumerOptions.OnError"/>.
+/// </para>
 /// </remarks>
 public sealed class RedisConsumer
 {
-    private readonly IDatabase _database;
-    private readonly string _queue;
-    private readonly string _processing;
+    private const int InitialIdleMilliseconds = 100;
+
+    private readonly RedisQueue _engine;
     private readonly IReadOnlyDictionary<string, BabelHandler> _handlers;
     private readonly RedisConsumerOptions _options;
 
@@ -33,19 +43,48 @@ public sealed class RedisConsumer
         string queue,
         IReadOnlyDictionary<string, BabelHandler> handlers,
         RedisConsumerOptions? options = null)
+        : this(database, queue, handlers, options, clock: null)
+    {
+    }
+
+    internal RedisConsumer(
+        IDatabase database,
+        string queue,
+        IReadOnlyDictionary<string, BabelHandler> handlers,
+        RedisConsumerOptions? options,
+        Func<double>? clock)
     {
         ArgumentNullException.ThrowIfNull(database);
         ArgumentException.ThrowIfNullOrEmpty(queue);
         ArgumentNullException.ThrowIfNull(handlers);
-        _database = database;
-        _queue = queue;
         _handlers = handlers;
         _options = options ?? new RedisConsumerOptions();
-        _processing = queue + _options.ProcessingSuffix;
+        _engine = new RedisQueue(
+            database,
+            queue,
+            _options.Layout,
+            _options.KeyPrefix,
+            _options.ProcessingSuffix,
+            _options.RetryAfter,
+            _options.MigrationBatchSize,
+            clock ?? ClockOf(_options.Clock),
+            _options.DeadLetterKey);
     }
 
-    /// <summary>The per-queue processing (reservation) list key in-flight messages are moved to.</summary>
-    public string ProcessingKey => _processing;
+    /// <summary>The legacy processing (reservation) list key; empty on the zset layout (see <see cref="ReservedKey"/>).</summary>
+    public string ProcessingKey => _engine.Processing;
+
+    /// <summary>The ready list key.</summary>
+    public string ReadyKey => _engine.Ready;
+
+    /// <summary>The zset <c>:reserved</c> sorted-set key; empty on the legacy layout.</summary>
+    public string ReservedKey => _engine.Reserved;
+
+    /// <summary>The dead-letter list key poison messages are written to.</summary>
+    public string DeadLetterKey => _engine.DeadLetter;
+
+    internal static Func<double>? ClockOf(Func<DateTimeOffset>? clock)
+        => clock is null ? null : () => clock().ToUnixTimeMilliseconds() / 1000.0;
 
     /// <summary>
     /// Reserve up to <see cref="RedisConsumerOptions.MaxMessages"/> messages, route each, and
@@ -58,46 +97,71 @@ public sealed class RedisConsumer
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            // Reserve: atomically move the head of the queue onto the processing list (LMOVE).
-            var element = await _database
-                .ListMoveAsync(_queue, _processing, ListSide.Left, ListSide.Right)
-                .ConfigureAwait(false);
-            if (element.IsNull)
+            var reservation = await _engine.ReserveAsync().ConfigureAwait(false);
+            if (reservation is null)
             {
                 break;
             }
 
             reserved++;
-            await HandleAsync(element!, cancellationToken).ConfigureAwait(false);
+            await HandleAsync(reservation, cancellationToken).ConfigureAwait(false);
         }
 
         return reserved;
     }
 
     /// <summary>
-    /// Poll until <paramref name="cancellationToken"/> is cancelled, waiting
-    /// <see cref="RedisConsumerOptions.IdleDelay"/> between empty polls so the loop does not spin.
+    /// Poll until <paramref name="cancellationToken"/> is cancelled. Between empty polls it sleeps 100 ms,
+    /// doubling up to <see cref="RedisConsumerOptions.IdleDelay"/>, and resets when a message arrives.
     /// </summary>
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
+        var cap = _options.IdleDelay;
+        var wait = cap < TimeSpan.FromMilliseconds(InitialIdleMilliseconds) ? cap : TimeSpan.FromMilliseconds(InitialIdleMilliseconds);
         while (!cancellationToken.IsCancellationRequested)
         {
             var reserved = await PollAsync(cancellationToken).ConfigureAwait(false);
-            if (reserved == 0 && _options.IdleDelay > TimeSpan.Zero)
+            if (reserved > 0)
             {
-                await Task.Delay(_options.IdleDelay, cancellationToken).ConfigureAwait(false);
+                wait = cap < TimeSpan.FromMilliseconds(InitialIdleMilliseconds) ? cap : TimeSpan.FromMilliseconds(InitialIdleMilliseconds);
+                continue;
+            }
+
+            if (wait > TimeSpan.Zero)
+            {
+                await Task.Delay(wait, cancellationToken).ConfigureAwait(false);
+                wait = wait + wait > cap ? cap : wait + wait;
             }
         }
     }
 
-    private async Task HandleAsync(string reserved, CancellationToken cancellationToken)
+    private async Task HandleAsync(RedisReservation reservation, CancellationToken cancellationToken)
     {
-        // The reserved list value is the LREM ack handle (frame or bare). Unframe it so the handler
-        // sees the §1.2 wire-envelope body and any out-of-band headers (ADR-0028) ride alongside; a
-        // bare value yields the value verbatim with no headers, so cross-version queues interoperate.
-        var (body, headers) = RedisFrame.Unframe(reserved);
+        if (reservation.IsPoison)
+        {
+            await DeadLetterPoisonAsync(reservation).ConfigureAwait(false);
+            return;
+        }
+
+        // Legacy: the reserved value may be a header frame (ADR-0028) — unframe it so the handler sees
+        // the §1.2 envelope body. Zset: the element is the bare body; framing is forbidden (A3).
+        string body;
+        IReadOnlyDictionary<string, string> headers;
+        if (_engine.Layout == RedisLayout.Legacy)
+        {
+            (body, headers) = RedisFrame.Unframe(reservation.HandlerBody.ToString());
+        }
+        else
+        {
+            body = reservation.HandlerBody.ToString();
+            headers = new Dictionary<string, string>();
+        }
 
         var envelope = EnvelopeCodec.Decode(body);
+        if (_engine.Layout == RedisLayout.Zset)
+        {
+            envelope = envelope with { Attempts = reservation.Attempts };
+        }
 
         if (!EnvelopeCodec.Accepts(envelope))
         {
@@ -113,7 +177,7 @@ public sealed class RedisConsumer
             if (_options.OnUnknownUrn is not null)
             {
                 await _options.OnUnknownUrn(envelope, body, cancellationToken).ConfigureAwait(false);
-                await AckAsync(reserved).ConfigureAwait(false);
+                await AckAsync(reservation).ConfigureAwait(false);
             }
             else
             {
@@ -126,21 +190,45 @@ public sealed class RedisConsumer
         try
         {
             await handler(envelope, body, headers, cancellationToken).ConfigureAwait(false);
-            await AckAsync(reserved).ConfigureAwait(false);
         }
 #pragma warning disable CA1031 // The consume loop must survive any handler exception.
         catch (Exception error)
 #pragma warning restore CA1031
         {
-            // Leave the element on the processing list — it stays reserved for a later sweep/retry.
             _options.OnError?.Invoke(error, envelope, body);
+            if (_options.OnHandlerFailure == RedisFailureAction.Release)
+            {
+                await ReleaseAsync(reservation).ConfigureAwait(false);
+            }
+
+            // Leave: the element stays reserved and is recovered after RetryAfter.
+            return;
+        }
+
+        await AckAsync(reservation).ConfigureAwait(false);
+    }
+
+    private async Task DeadLetterPoisonAsync(RedisReservation reservation)
+    {
+        var moved = await _engine.DeadLetterAsync(reservation, reservation.HandlerBody).ConfigureAwait(false);
+        _options.OnWarning?.Invoke(moved
+            ? "poison element moved to the dead-letter list"
+            : RedisQueue.ExpiredWarning);
+    }
+
+    private async Task AckAsync(RedisReservation reservation)
+    {
+        if (!await _engine.AckAsync(reservation).ConfigureAwait(false))
+        {
+            _options.OnWarning?.Invoke(RedisQueue.ExpiredWarning);
         }
     }
 
-    /// <summary>
-    /// Ack: remove the reserved element from the processing list (LREM, count 1). The handle is the
-    /// raw stored value (frame or bare), so the LREM matches what was RPUSHed.
-    /// </summary>
-    private async Task AckAsync(string reserved)
-        => await _database.ListRemoveAsync(_processing, reserved, 1).ConfigureAwait(false);
+    private async Task ReleaseAsync(RedisReservation reservation)
+    {
+        if (!await _engine.ReleaseAsync(reservation, _options.ReleaseDelay).ConfigureAwait(false))
+        {
+            _options.OnWarning?.Invoke(RedisQueue.ExpiredWarning);
+        }
+    }
 }

@@ -72,11 +72,58 @@ ack. A throwing handler leaves the element on the processing list (at-least-once
 loop never stops on a bad message — observe via `OnError` / `OnUnknownUrn`. The envelope is
 unchanged (`schema_version` stays `1`); Redis support is purely additive.
 
-> **Reliable-queue scope.** This is a **.NET-owned reliable queue**: produce/reserve/ack are
-> self-consistent and crash-safe on a queue this SDK owns end-to-end. Full parity with
-> Laravel's reserved-sorted-set reservation on a *shared* PHP+.NET Redis queue
-> (`queues:<name>:reserved` scored by `retry_after`, attempts incremented by the reservation
-> Lua script) is a separate task — see broker-bindings §1.4.
+> **Reliable-queue scope.** The default (`RedisLayout.Legacy`) is a **.NET-owned reliable queue**:
+> produce/reserve/ack are self-consistent and crash-safe on a queue this SDK owns end-to-end. A
+> reservation carries a deadline on `<queue>:processing:deadlines`; before every reserve a sweep
+> returns expired reservations to the ready list byte for byte. To share a queue with Laravel,
+> opt in to the zset layout below.
+
+## Laravel-compatible zset layout (ADR-0034 §1)
+
+```csharp
+var options = new RedisConsumerOptions
+{
+    Layout = RedisLayout.Zset,      // queues:<name> + :delayed + :reserved + :notify
+    RetryAfter = TimeSpan.FromSeconds(90),
+    OnHandlerFailure = RedisFailureAction.Release,  // default: Leave (retried after RetryAfter)
+    ReleaseDelay = TimeSpan.FromSeconds(5),
+};
+var consumer = new RedisConsumer(db, "orders", handlers, options);
+
+var publisher = new RedisPublisher(db, "orders", new RedisPublisherOptions { Layout = RedisLayout.Zset });
+await publisher.PublishDelayedAsync("urn:babel:orders:created", data, TimeSpan.FromSeconds(30));
+```
+
+Every reserve first migrates due `:delayed` and `:reserved` members, then runs Laravel's pop script
+(attempts + 1, deadline `floor(now) + retry_after`). An element the script cannot parse is
+dead-lettered as poison to `DeadLetterKey`. `KeyPrefix` defaults to `queues:`.
+
+Limits of the zset layout:
+
+- The `__bq_frame` key is forbidden there, so header frames are dropped and **`traceparent` is not
+  carried** (the out-of-band propagation below only works on the legacy layout).
+- On Redis Cluster the queue name must carry a hash tag (`{orders}`) so the keys share a slot.
+- A handler that throws leaves the message reserved by default; it returns after `RetryAfter`. Set
+  `OnHandlerFailure = Release` to park it on `:delayed` straight away (attempts + 1).
+
+Messages that cannot be routed (both layouts):
+
+- A non-conformant envelope (`Accepts == false`) and an unmapped URN with no `OnUnknownUrn` hook only
+  invoke `OnError`; they are **not** acked and **not** dead-lettered. The reservation then lapses and the
+  message is redelivered every `RetryAfter` (legacy: the sweep returns it to the ready list; zset: the
+  migrate step does, and `attempts` grows on every round with no upper bound). ADR-0033 section 9 only accepts
+  the crash loop (a message that kills its consumer, since recovery does not bump `attempts`); whether
+  rejected or unroutable messages should loop is an open decision. Give such messages a home with an
+  `OnUnknownUrn` hook (or a handler for the URN), and alert on `OnError`.
+- Zset layout only: the `:reserved` member is the (re-encoded) job body itself (ADR-0033 section 3), so
+  byte-identical elements share **one** reservation. If two workers hold identical copies at the same
+  time, the first ack / dead-letter wins and the other finds the reservation gone (`reservation expired`
+  warning). For poison this means that of N identical concurrent poison copies only one reaches the
+  dead-letter list; the count is lost. This affects any byte-identical duplicates, whether hand-pushed or produced by
+  an at-least-once producer resending the same `meta.id` (for example an outbox relay retry);
+  ADR-0033 section 12 records this as Laravel's unchanged behaviour.
+- `IdleDelay` (sleep between empty polls) starts at 100 ms, doubles, and is capped at 1 s (ADR-0033
+  section 10); a larger configured value is clamped to `RedisConsumerOptions.MaxIdleDelay`.
 
 ## OpenTelemetry `traceparent` propagation (ADR-0028)
 

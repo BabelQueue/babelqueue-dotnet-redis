@@ -25,47 +25,46 @@ public sealed class RedisConformanceTests
     }
 
     [Fact]
-    public async Task PayloadIdentityMatchesGolden()
+    public async Task PayloadIdentityMatchesGolden() =>
+        await RedisConformanceSuite.Find("redis", "payload_identity").Run();
+
+    public static IEnumerable<object[]> PureCases() =>
+        RedisConformanceSuite.All().Where(c => !c.NeedsRedis && c.Section != "redis").Select(c => new object[] { c.Section, c.Id });
+
+    public static IEnumerable<object[]> LiveCases() =>
+        RedisConformanceSuite.All().Where(c => c.NeedsRedis).Select(c => new object[] { c.Section, c.Id });
+
+    /// <summary><c>redis_delay</c> score formula and <c>redis_layout.cases</c> key names: pure, no Redis.</summary>
+    [Theory]
+    [MemberData(nameof(PureCases))]
+    public async Task PureCase(string section, string id) =>
+        await RedisConformanceSuite.Find(section, id).Run();
+
+    /// <summary>
+    /// The behavioural <c>redis_layout</c> blocks against a live Redis (the real Lua scripts). Skipped
+    /// without Redis unless <c>BQ_REQUIRE_REDIS</c> is set, in which case an unreachable Redis fails.
+    /// </summary>
+    [LiveTheory]
+    [MemberData(nameof(LiveCases))]
+    public async Task BehaviouralCase(string section, string id) =>
+        await RedisConformanceSuite.Find(section, id).Run();
+
+    /// <summary>
+    /// Runs every Redis-scoped case and writes <c>results.json</c> to <c>BQ_CONFORMANCE_RESULTS</c> when
+    /// that is set (ADR-0032 section 2). Never records a skip: an unreachable Redis is a failure.
+    /// </summary>
+    [LiveFact]
+    public async Task ResultsHaveNoFailuresAndAreWrittenOnRequest()
     {
-        var identity = Redis().GetProperty("payload_identity");
-        var fixtureBody = File.ReadAllText(Path.Combine(Dir, identity.GetProperty("envelope_file").GetString()!));
-        var fixtureEnvelope = EnvelopeCodec.Decode(fixtureBody);
-
-        // Capture exactly what RedisPublisher pushes onto the list.
-        RedisValue pushed = RedisValue.Null;
-        var mock = new Mock<IDatabase>();
-        mock.Setup(d => d.ListRightPushAsync(Queue, It.IsAny<RedisValue>(), It.IsAny<When>(), It.IsAny<CommandFlags>()))
-            .Callback<RedisKey, RedisValue, When, CommandFlags>((_, value, _, _) => pushed = value)
-            .ReturnsAsync(1L);
-
-        // Re-publish the fixture's logical message (same urn/data/trace) and assert the
-        // stored element decodes to the same envelope and carries no extra wrapping.
-        await new RedisPublisher(mock.Object, Queue).PublishAsync(
-            EnvelopeCodec.Urn(fixtureEnvelope),
-            fixtureEnvelope.Data,
-            fixtureEnvelope.TraceId);
-
-        var stored = (string)pushed!;
-
-        // The element IS the envelope JSON — no wrapping object around it.
-        using var storedDoc = JsonDocument.Parse(stored);
-        Assert.Equal(JsonValueKind.Object, storedDoc.RootElement.ValueKind);
-        Assert.Equal(
-            new[] { "job", "trace_id", "data", "meta", "attempts" },
-            storedDoc.RootElement.EnumerateObject().Select(p => p.Name).ToArray());
-
-        // Byte-for-byte: the stored element equals the canonical encoding of the envelope it
-        // decodes to (idempotent round-trip — no mutation, no added metadata).
-        Assert.Equal(EnvelopeCodec.Encode(EnvelopeCodec.Decode(stored)), stored);
-
-        // Contract fields are preserved verbatim from the fixture (per-message ids excepted).
-        var storedEnvelope = EnvelopeCodec.Decode(stored);
-        Assert.Equal(fixtureEnvelope.Job, storedEnvelope.Job);
-        Assert.Equal(fixtureEnvelope.TraceId, storedEnvelope.TraceId);
-        Assert.Equal(fixtureEnvelope.Attempts, storedEnvelope.Attempts);
-        Assert.Equal(
-            fixtureEnvelope.Data!["order_id"]!.ToString(),
-            storedEnvelope.Data!["order_id"]!.ToString());
+        var json = await RedisConformanceSuite.WriteResultsAsync(Environment.GetEnvironmentVariable("BQ_CONFORMANCE_RESULTS"));
+        using var doc = JsonDocument.Parse(json);
+        var failures = doc.RootElement.GetProperty("sections").EnumerateObject()
+            .SelectMany(s => s.Value.EnumerateObject().Select(c => (Section: s.Name, Case: c.Name, Result: c.Value)))
+            .Where(x => x.Result.GetProperty("status").GetString() != "pass")
+            .Select(x => $"{x.Section}/{x.Case}: {x.Result.GetProperty("reason").GetString()}")
+            .ToList();
+        Assert.True(failures.Count == 0, string.Join(Environment.NewLine, failures));
+        Assert.Equal("redis", Assert.Single(doc.RootElement.GetProperty("bindings").EnumerateArray()).GetString());
     }
 
     [Fact]

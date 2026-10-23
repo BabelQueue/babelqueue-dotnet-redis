@@ -17,7 +17,6 @@ namespace BabelQueue.Redis.Tests;
 public sealed class RedisHeadersTests
 {
     private const string Queue = "orders";
-    private const string Processing = "orders:processing";
     private const string Traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
 
     private static (Mock<IDatabase> Mock, Func<RedisValue> Pushed) MockDatabase()
@@ -150,12 +149,10 @@ public sealed class RedisHeadersTests
         var env = EnvelopeCodec.Encode(EnvelopeCodec.Make("urn:babel:orders:created", new Dictionary<string, object?> { ["x"] = 1 }, Queue));
         var stored = RedisFrame.FrameValue(env, new Dictionary<string, string> { ["traceparent"] = Traceparent });
 
-        var queue = new Queue<string>(new[] { stored });
-        var mock = new Mock<IDatabase>();
-        mock.Setup(d => d.ListMoveAsync(Queue, Processing, ListSide.Left, ListSide.Right, It.IsAny<CommandFlags>()))
-            .ReturnsAsync(() => queue.Count > 0 ? queue.Dequeue() : RedisValue.Null);
-        mock.Setup(d => d.ListRemoveAsync(Processing, It.IsAny<RedisValue>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
-            .ReturnsAsync(1L);
+        var db = new ScriptDb()
+            .Queue(RedisScripts.LegacyReserve, ScriptDb.Text(stored))
+            .On(RedisScripts.LegacyAck, _ => ScriptDb.Integer(1))
+            .On(RedisScripts.LegacySweep, _ => ScriptDb.Integer(0));
 
         string? rawSeen = null;
         IReadOnlyDictionary<string, string>? headersSeen = null;
@@ -164,14 +161,15 @@ public sealed class RedisHeadersTests
             ["urn:babel:orders:created"] = (_, raw, headers, _) => { rawSeen = raw; headersSeen = headers; return Task.CompletedTask; },
         };
 
-        await new RedisConsumer(mock.Object, Queue, handlers).PollAsync();
+        await new RedisConsumer(db.Object, Queue, handlers).PollAsync();
 
         // The handler sees the un-framed wire envelope, plus the carried traceparent header.
         Assert.Equal(env, rawSeen);
         Assert.Equal(Traceparent, headersSeen!["traceparent"]);
-        // Ack must LREM the *stored* value (the frame), not the un-framed body.
-        mock.Verify(d => d.ListRemoveAsync(Processing, stored, 1, It.IsAny<CommandFlags>()), Times.Once);
-        mock.Verify(d => d.ListRemoveAsync(Processing, env, 1, It.IsAny<CommandFlags>()), Times.Never);
+        // Ack must present the *stored* value (the frame), not the un-framed body.
+        var ack = Assert.Single(db.Of(RedisScripts.LegacyAck));
+        Assert.Equal(stored, (string)ack.Values[1]!);
+        Assert.NotEqual(env, (string)ack.Values[1]!);
     }
 
     [Fact]
@@ -180,12 +178,10 @@ public sealed class RedisHeadersTests
         var env = EnvelopeCodec.Encode(EnvelopeCodec.Make("urn:babel:orders:created", null, Queue));
         var stored = RedisFrame.FrameValue(env, new Dictionary<string, string> { ["traceparent"] = Traceparent });
 
-        var queue = new Queue<string>(new[] { stored });
-        var mock = new Mock<IDatabase>();
-        mock.Setup(d => d.ListMoveAsync(Queue, Processing, ListSide.Left, ListSide.Right, It.IsAny<CommandFlags>()))
-            .ReturnsAsync(() => queue.Count > 0 ? queue.Dequeue() : RedisValue.Null);
-        mock.Setup(d => d.ListRemoveAsync(Processing, It.IsAny<RedisValue>(), It.IsAny<long>(), It.IsAny<CommandFlags>()))
-            .ReturnsAsync(1L);
+        var db = new ScriptDb()
+            .Queue(RedisScripts.LegacyReserve, ScriptDb.Text(stored))
+            .On(RedisScripts.LegacyAck, _ => ScriptDb.Integer(1))
+            .On(RedisScripts.LegacySweep, _ => ScriptDb.Integer(0));
 
         System.Diagnostics.ActivityContext? parent = null;
         var handlers = new Dictionary<string, BabelHandler>
@@ -197,7 +193,7 @@ public sealed class RedisHeadersTests
             },
         };
 
-        await new RedisConsumer(mock.Object, Queue, handlers).PollAsync();
+        await new RedisConsumer(db.Object, Queue, handlers).PollAsync();
 
         Assert.NotNull(parent);
         Assert.Equal("0af7651916cd43dd8448eb211c80319c", parent!.Value.TraceId.ToHexString());
