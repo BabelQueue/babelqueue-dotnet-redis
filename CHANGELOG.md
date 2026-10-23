@@ -11,7 +11,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ### Added
 
-- **Zset layout (opt-in):** `RedisLayout.Zset` on `RedisConsumerOptions.Layout` / `RedisPublisherOptions.Layout` speaks Laravel's sorted-set queue (`queues:<name>`, `:delayed`, `:reserved`, `:notify`) with Laravel's Lua pop / release / migrate scripts (ADR-0034 §1). Options: `KeyPrefix`, `RetryAfter`, `MigrationBatchSize`. `RedisPublisher.PublishDelayedAsync` (zset only) parks a message on `:delayed`.
+- **Zset layout (opt-in):** `RedisLayout.Zset` on `RedisConsumerOptions.Layout` / `RedisPublisherOptions.Layout` speaks Laravel's sorted-set queue (`queues:<name>`, `:delayed`, `:reserved`, `:notify`) with Laravel's Lua pop / release / migrate scripts (ADR-0033 §1). Options: `KeyPrefix`, `RetryAfter`, `MigrationBatchSize`. `RedisPublisher.PublishDelayedAsync` (zset only) parks a message on `:delayed`.
 - `RedisConsumerOptions.OnHandlerFailure` (`RedisFailureAction.Leave` | `Release`) and `ReleaseDelay`: opt-in immediate release of a message whose handler threw (default `Leave`, behaviour unchanged).
 - Legacy layout: a deadline sweep (`<queue>:processing:deadlines`) returns an expired reservation to the ready list byte for byte, so a crashed worker's message is no longer stranded. The default `:processing` mode and `ProcessingSuffix` are unchanged.
 - CI runs a `redis:7` service with `BQ_REQUIRE_REDIS=1` (the `redis_layout` behavioural cases and the Lua integration tests must not skip) in `ci.yml` and `release.yml`.
@@ -26,7 +26,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 - README: a non-conformant envelope or an unmapped URN without `OnUnknownUrn` is only reported to `OnError` and redelivered every `retry_after` (zset `attempts` grows unbounded). Unchanged behaviour, now documented.
 
-- README: zset reservations are keyed by the job body, so byte-identical elements (notably identical poison copies handled concurrently) share one `:reserved` member and only one reaches the DLQ (ADR-0033 section 3 contract limit).
+- README: zset reservations are keyed by the job body, so byte-identical elements (notably identical poison copies handled concurrently) share one `:reserved` member and only one reaches the DLQ (ADR-0033 §12 contract limit, broker-bindings §1.7).
 
 ### Tests
 
@@ -34,7 +34,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ### Limits
 
-- On the zset layout the `__bq_frame` key is forbidden, so header frames are dropped and `traceparent` is not carried (A3). On Redis Cluster the queue name needs a hash tag (`{orders}`).
+- On the zset layout the `__bq_frame` key is forbidden, so header frames are dropped and `traceparent` is not carried (ADR-0033 §5). On Redis Cluster the queue name needs a hash tag (`{orders}`).
 
 ### Changed
 
