@@ -128,7 +128,7 @@ public sealed class RedisZsetTests
     }
 
     [Fact]
-    public async Task PoisonElementIsDeadLetteredAndNeverReachesTheHandler()
+    public async Task PoisonElementIsDeadLetteredInTheAdrRecordAndNeverReachesTheHandler()
     {
         const string poison = "{not json";
         var db = Reserving(Poisoned(poison));
@@ -141,9 +141,39 @@ public sealed class RedisZsetTests
         var dlq = Assert.Single(db.Of(RedisScripts.ZsetDeadLetter));
         Assert.Equal(new[] { "queues:orders:reserved", "queues:orders.dlq", "queues:orders.dlq:notify" }, dlq.Keys);
         Assert.Equal(poison, (string)dlq.Values[0]!);
-        Assert.Equal(poison, (string)dlq.Values[1]!);
+        using (var doc = System.Text.Json.JsonDocument.Parse((string)dlq.Values[1]!))
+        {
+            Assert.Equal(poison, doc.RootElement.GetProperty("raw").GetString());
+            Assert.False(doc.RootElement.TryGetProperty("raw_encoding", out _));
+        }
+        RedisConsumerTests.AssertPoisonBlock((string)dlq.Values[1]!, "orders");
         Assert.Empty(db.SortedRemoves);
         Assert.Equal(new[] { "poison element moved to the dead-letter list" }, warnings);
+    }
+
+    [Fact]
+    public async Task DecodableEnvelopeWithInvalidUtf8IsPoisonNeverDeliveredAndDeadLetteredInTheBase64Wrapper()
+    {
+        // The pop script (cjson) decodes this and answers a re-encoded reserved member that differs from the job (K-G).
+        var job = RedisConsumerTests.BadUtf8Envelope();
+        var reserved = (byte[])job.Clone();
+        var db = Reserving(ScriptDb.BytePair(job, reserved));
+        var called = false;
+
+        await Consumer(db, (_, _, _, _) => { called = true; return Task.CompletedTask; }).PollAsync();
+
+        Assert.False(called);
+        var dlq = Assert.Single(db.Of(RedisScripts.ZsetDeadLetter));
+        Assert.Equal(reserved, (byte[])dlq.Values[0]!);
+        using (var doc = System.Text.Json.JsonDocument.Parse((string)dlq.Values[1]!))
+        {
+            Assert.Equal("base64", doc.RootElement.GetProperty("raw_encoding").GetString());
+            Assert.Equal(job, Convert.FromBase64String(doc.RootElement.GetProperty("raw").GetString()!));
+        }
+        RedisConsumerTests.AssertPoisonBlock((string)dlq.Values[1]!, "orders");
+        Assert.Empty(db.Of(RedisScripts.ZsetRelease));
+        Assert.Empty(db.SortedRemoves);
+        Assert.Empty(db.SortedAdds);
     }
 
     [Fact]
@@ -254,7 +284,7 @@ public sealed class RedisZsetTests
     }
 
     [Fact]
-    public async Task NonConformantEnvelopeIsDeadLetteredRawAndNeverAcked()
+    public async Task NonConformantEnvelopeIsDeadLetteredAsAPoisonRecordAndNeverAcked()
     {
         const string raw = "{\"not\":\"an envelope\"}";
         var db = Reserving(Delivered(raw, raw + " "));
@@ -263,7 +293,8 @@ public sealed class RedisZsetTests
         await Consumer(db, null, Zset(o => o.OnWarning = warnings.Add)).PollAsync();
 
         var dlq = Assert.Single(db.Of(RedisScripts.ZsetDeadLetter));
-        Assert.Equal(raw, (string)dlq.Values[1]!);
+        RedisConsumerTests.AssertSpliced(raw, (string)dlq.Values[1]!);
+        RedisConsumerTests.AssertPoisonBlock((string)dlq.Values[1]!, "orders");
         Assert.Empty(db.SortedRemoves);
         Assert.Equal(new[] { "non-conformant envelope moved to the dead-letter list" }, warnings);
     }

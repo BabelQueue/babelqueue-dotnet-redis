@@ -1,3 +1,6 @@
+using System.Text;
+using System.Text.Encodings.Web;
+using System.Text.Json;
 using StackExchange.Redis;
 
 namespace BabelQueue.Redis;
@@ -38,6 +41,14 @@ namespace BabelQueue.Redis;
 public sealed class RedisConsumer
 {
     private const int InitialIdleMilliseconds = 100;
+
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+    private static readonly JsonWriterOptions PoisonWriterOptions = new()
+    {
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        Indented = false,
+    };
 
     private readonly string _queue;
     private readonly RedisQueue _engine;
@@ -176,10 +187,12 @@ public sealed class RedisConsumer
                 new BabelQueueException("Rejected a non-conformant BabelQueue envelope from Redis."),
                 envelope, body);
 
-            // Never best-effort re-encoded (an unsupported schema is not parsed): the raw element, as stored,
-            // goes to the dead-letter list — the same record a poison element gets.
-            await DeadLetterAsync(reservation, reservation.HandlerBody, "non-conformant envelope moved to the dead-letter list")
-                .ConfigureAwait(false);
+            // Never best-effort re-encoded (an unsupported schema is not parsed): the body's bytes go to the
+            // dead-letter list unchanged inside the ADR-0035 record — the same record a poison element gets.
+            await DeadLetterAsync(
+                reservation,
+                PoisonRecordFor(reservation, Encoding.UTF8.GetBytes(body)),
+                "non-conformant envelope moved to the dead-letter list").ConfigureAwait(false);
             return;
         }
 
@@ -229,7 +242,65 @@ public sealed class RedisConsumer
     }
 
     private Task DeadLetterPoisonAsync(RedisReservation reservation)
-        => DeadLetterAsync(reservation, reservation.HandlerBody, "poison element moved to the dead-letter list");
+        => DeadLetterAsync(reservation, PoisonRecordFor(reservation, PoisonBodyBytes(reservation)), "poison element moved to the dead-letter list");
+
+    /// <summary>
+    /// The bytes of a poison element as the DLQ record carries them: the stored element, with a legacy header frame
+    /// (ADR-0028) unwrapped so the record is the ADR-0035 record of the envelope body itself. An element that is not
+    /// valid UTF-8 is kept byte for byte (it cannot be a frame).
+    /// </summary>
+    private byte[] PoisonBodyBytes(RedisReservation reservation)
+    {
+        var stored = (byte[]?)reservation.HandlerBody ?? [];
+        if (_engine.Layout != RedisLayout.Legacy)
+        {
+            return stored;
+        }
+
+        try
+        {
+            var (body, _) = RedisFrame.Unframe(StrictUtf8.GetString(stored));
+            return Encoding.UTF8.GetBytes(body);
+        }
+        catch (DecoderFallbackException)
+        {
+            return stored;
+        }
+    }
+
+    /// <summary>
+    /// The poison DLQ record (ADR-0035, broker-bindings §1.1 / §1.3): <paramref name="body"/> spliced byte for byte
+    /// with an additive <c>dead_letter</c> block (<c>reason: poison</c>, <c>original_queue</c>, <c>attempts: 0</c>,
+    /// <c>lang: dotnet</c>), or the <c>raw</c> wrapper when the body is not a spliceable JSON object. If the record
+    /// cannot be built the stored element is dead-lettered instead — the message is never lost.
+    /// </summary>
+    private RedisValue PoisonRecordFor(RedisReservation reservation, byte[] body)
+    {
+        try
+        {
+            using var stream = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(stream, PoisonWriterOptions))
+            {
+                writer.WriteStartObject();
+                writer.WriteString("reason", "poison");
+                writer.WriteString("error", "Redis value is not a conformant BabelQueue envelope.");
+                writer.WriteString("exception", typeof(BabelQueueException).FullName);
+                writer.WriteNumber("failed_at", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                writer.WriteString("original_queue", _queue);
+                writer.WriteNumber("attempts", 0);
+                writer.WriteString("lang", EnvelopeCodec.SourceLang);
+                writer.WriteEndObject();
+            }
+
+            return PoisonRecord.Build(body, Encoding.UTF8.GetString(stream.ToArray()));
+        }
+#pragma warning disable CA1031 // Never lose the message: fall back to the stored element.
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+            return reservation.HandlerBody;
+        }
+    }
 
     private async Task DeadLetterAsync(RedisReservation reservation, RedisValue body, string movedWarning)
     {

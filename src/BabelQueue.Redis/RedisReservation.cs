@@ -1,3 +1,4 @@
+using System.Text;
 using StackExchange.Redis;
 
 namespace BabelQueue.Redis;
@@ -13,7 +14,7 @@ internal sealed class RedisReservation
         HandlerBody = handlerBody;
         Reserved = reserved;
         Token = token;
-        IsPoison = isPoison;
+        IsPoison = isPoison || HasInvalidUtf8(handlerBody) || HasInvalidUtf8(reserved);
         Attempts = attempts;
     }
 
@@ -29,9 +30,34 @@ internal sealed class RedisReservation
     /// <summary>Legacy layout only: the 32-hex-char reservation token (null in the zset layout).</summary>
     internal string? Token { get; }
 
-    /// <summary>True when the zset pop script could not decode the element (A1) — it must be dead-lettered.</summary>
+    /// <summary>
+    /// True when the element must be dead-lettered rather than delivered: the zset pop script could not decode it (A1),
+    /// or the stored bytes (the element, or the zset <c>:reserved</c> member) are not valid UTF-8 — poison in both
+    /// layouts even when the codec could decode it (broker-bindings §1.1). Such an element is never handed to a handler
+    /// and never retried or re-published; it is dead-lettered byte for byte on first delivery.
+    /// </summary>
     internal bool IsPoison { get; }
 
     /// <summary>The attempt number this delivery counts as: <c>attempts + 1</c>, or 1 for a poison element.</summary>
     internal int Attempts { get; }
+
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+    private static bool HasInvalidUtf8(RedisValue value)
+    {
+        if (value.IsNull)
+        {
+            return false;
+        }
+
+        try
+        {
+            StrictUtf8.GetCharCount((byte[]?)value ?? []);
+            return false;
+        }
+        catch (DecoderFallbackException)
+        {
+            return true;
+        }
+    }
 }

@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using BabelQueue;
 using BabelQueue.Redis;
@@ -24,6 +25,26 @@ public sealed class RedisConsumerTests
             .On(RedisScripts.LegacyRelease, _ => ScriptDb.Integer(1))
             .On(RedisScripts.LegacyDeadLetter, _ => ScriptDb.Integer(1))
             .On(RedisScripts.LegacySweep, _ => ScriptDb.Integer(0));
+
+    /// <summary>The <c>dead_letter</c> block of a poison record, asserted to be the ADR-0035 poison block of <c>orders</c>.</summary>
+    internal static JsonElement AssertPoisonBlock(string record, string queue = Queue)
+    {
+        using var doc = JsonDocument.Parse(record);
+        var block = doc.RootElement.GetProperty("dead_letter").Clone();
+        Assert.Equal("poison", block.GetProperty("reason").GetString());
+        Assert.Equal(queue, block.GetProperty("original_queue").GetString());
+        Assert.Equal(0, block.GetProperty("attempts").GetInt32());
+        Assert.Equal("dotnet", block.GetProperty("lang").GetString());
+        Assert.True(block.GetProperty("failed_at").GetInt64() > 0);
+        return block;
+    }
+
+    /// <summary>A spliced record keeps every original byte: <paramref name="body"/> minus its closing brace, then the block.</summary>
+    internal static void AssertSpliced(string body, string record)
+    {
+        Assert.StartsWith(body[..^1] + ",\"dead_letter\":{", record, StringComparison.Ordinal);
+        Assert.EndsWith("}}", record, StringComparison.Ordinal);
+    }
 
     private static string Envelope(int attempts = 0)
     {
@@ -159,7 +180,7 @@ public sealed class RedisConsumerTests
     }
 
     [Fact]
-    public async Task NonConformantEnvelopeIsReportedAndDeadLetteredRawWithoutAnAck()
+    public async Task NonConformantEnvelopeIsReportedAndDeadLetteredAsAPoisonRecordWithoutAnAck()
     {
         const string raw = "{\"not\":\"an envelope\"}";
         var db = Reserving(raw);
@@ -173,14 +194,90 @@ public sealed class RedisConsumerTests
         var dlq = Assert.Single(db.Of(RedisScripts.LegacyDeadLetter));
         Assert.Equal(new[] { Processing, Deadlines, "orders.dlq" }, dlq.Keys);
         Assert.Equal(raw, (string)dlq.Values[1]!);
-        Assert.Equal(raw, (string)dlq.Values[2]!);
+        AssertSpliced(raw, (string)dlq.Values[2]!);
+        AssertPoisonBlock((string)dlq.Values[2]!);
         Assert.Matches("^[0-9a-f]{32}$", (string)dlq.Values[0]!);
         Assert.Empty(db.Of(RedisScripts.LegacyAck));
         Assert.Equal(new[] { "non-conformant envelope moved to the dead-letter list" }, warnings);
     }
 
     [Fact]
-    public async Task UnsupportedSchemaVersionIsDeadLetteredByteForByte()
+    public async Task DecodableEnvelopeWithInvalidUtf8IsPoisonNeverDeliveredAndDeadLetteredInTheBase64Wrapper()
+    {
+        // A conformant envelope whose data carries a lone 0xFF byte: the codec could decode it, yet it is poison (K-G).
+        var stored = BadUtf8Envelope();
+        var db = new ScriptDb()
+            .Queue(RedisScripts.LegacyReserve, ScriptDb.Bytes(stored))
+            .On(RedisScripts.LegacyAck, _ => ScriptDb.Integer(1))
+            .On(RedisScripts.LegacyRelease, _ => ScriptDb.Integer(1))
+            .On(RedisScripts.LegacyDeadLetter, _ => ScriptDb.Integer(1))
+            .On(RedisScripts.LegacySweep, _ => ScriptDb.Integer(0));
+        var called = false;
+        var handlers = new Dictionary<string, BabelHandler> { ["urn:babel:orders:created"] = (_, _, _, _) => { called = true; return Task.CompletedTask; } };
+
+        await Consumer(db, handlers).PollAsync();
+
+        Assert.False(called);
+        var dlq = Assert.Single(db.Of(RedisScripts.LegacyDeadLetter));
+        Assert.Equal(stored, (byte[])dlq.Values[1]!);
+        using (var doc = JsonDocument.Parse((string)dlq.Values[2]!))
+        {
+            Assert.Equal("base64", doc.RootElement.GetProperty("raw_encoding").GetString());
+            Assert.Equal(stored, Convert.FromBase64String(doc.RootElement.GetProperty("raw").GetString()!));
+        }
+        AssertPoisonBlock((string)dlq.Values[2]!);
+        Assert.Empty(db.Of(RedisScripts.LegacyAck));
+        Assert.Empty(db.Of(RedisScripts.LegacyRelease));
+        Assert.Empty(db.Pushed);
+    }
+
+    /// <summary>A valid, decodable envelope body with one invalid UTF-8 byte (0xFF) inside a data string.</summary>
+    internal static byte[] BadUtf8Envelope()
+    {
+        var env = EnvelopeCodec.Make("urn:babel:orders:created", new Dictionary<string, object?> { ["note"] = "XX" }, Queue);
+        var text = EnvelopeCodec.Encode(env);
+        var bytes = System.Text.Encoding.UTF8.GetBytes(text);
+        var at = text.IndexOf("XX", StringComparison.Ordinal);
+        bytes[at] = 0xFF;
+        return bytes;
+    }
+
+    [Fact]
+    public async Task NonObjectPoisonIsDeadLetteredInTheRawWrapper()
+    {
+        const string raw = "not json at all";
+        var db = Reserving(raw);
+
+        await Consumer(db, null, null).PollAsync();
+
+        var dlq = Assert.Single(db.Of(RedisScripts.LegacyDeadLetter));
+        Assert.Equal(raw, (string)dlq.Values[1]!);
+        using var doc = JsonDocument.Parse((string)dlq.Values[2]!);
+        Assert.Equal(raw, doc.RootElement.GetProperty("raw").GetString());
+        Assert.False(doc.RootElement.TryGetProperty("raw_encoding", out _));
+        AssertPoisonBlock((string)dlq.Values[2]!);
+    }
+
+    [Fact]
+    public async Task FramedNonConformantValueIsDeadLetteredUnwrappedInTheAdrShape()
+    {
+        const string inner = "{\"not\":\"an envelope\"}";
+        var framed = RedisFrame.FrameValue(inner, new Dictionary<string, string> { ["traceparent"] = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" });
+        var db = Reserving(framed);
+
+        await Consumer(db, null, null).PollAsync();
+
+        var dlq = Assert.Single(db.Of(RedisScripts.LegacyDeadLetter));
+        // The reservation handle is the stored element; the DLQ element is the ADR-0035 record of the body itself.
+        Assert.Equal(framed, (string)dlq.Values[1]!);
+        var record = (string)dlq.Values[2]!;
+        AssertSpliced(inner, record);
+        Assert.DoesNotContain("__bq_frame", record, StringComparison.Ordinal);
+        AssertPoisonBlock(record);
+    }
+
+    [Fact]
+    public async Task UnsupportedSchemaVersionIsDeadLetteredAsAPoisonRecordKeepingEveryByte()
     {
         var raw = Envelope().Replace("\"schema_version\":1", "\"schema_version\":99", StringComparison.Ordinal);
         Assert.Contains("\"schema_version\":99", raw, StringComparison.Ordinal);
@@ -189,7 +286,9 @@ public sealed class RedisConsumerTests
         await Consumer(db, Handlers((_, _, _, _) => Task.CompletedTask)).PollAsync();
 
         var dlq = Assert.Single(db.Of(RedisScripts.LegacyDeadLetter));
-        Assert.Equal(raw, (string)dlq.Values[2]!);
+        // Version-gated: not parsed, so every original byte survives inside the record.
+        AssertSpliced(raw, (string)dlq.Values[2]!);
+        AssertPoisonBlock((string)dlq.Values[2]!);
     }
 
     [Fact]

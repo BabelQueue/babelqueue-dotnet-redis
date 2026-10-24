@@ -123,7 +123,14 @@ public sealed class RedisLiveTests : IDisposable
         Assert.Empty(seen);
         Assert.Equal(0, await _db.SortedSetLengthAsync("queues:" + _queue + ":reserved"));
         var dead = (await _db.ListRangeAsync("queues:" + _queue + ".dlq")).Select(v => (string)v!).ToList();
-        Assert.Equal(new[] { undecodable, stringAttempts }, dead);
+        Assert.Equal(2, dead.Count);
+        using (var wrapped = System.Text.Json.JsonDocument.Parse(dead[0]))
+        {
+            Assert.Equal(undecodable, wrapped.RootElement.GetProperty("raw").GetString());
+        }
+        RedisConsumerTests.AssertPoisonBlock(dead[0], _queue);
+        RedisConsumerTests.AssertSpliced(stringAttempts, dead[1]);
+        RedisConsumerTests.AssertPoisonBlock(dead[1], _queue);
     }
 
     [LiveFact]

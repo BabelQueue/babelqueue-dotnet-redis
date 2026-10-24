@@ -58,6 +58,11 @@ internal sealed class ScriptDb
 
     internal static RedisResult Text(string value) => RedisResult.Create((RedisValue)value);
 
+    /// <summary>A bulk reply carrying the exact <paramref name="value"/> bytes (which need not be valid UTF-8).</summary>
+    internal static RedisResult Bytes(byte[] value) => RedisResult.Create((RedisValue)value);
+
+    internal static RedisResult BytePair(byte[] first, byte[] second) => RedisResult.Create(new RedisValue[] { first, second });
+
     internal static RedisResult Pair(string first, string second) => RedisResult.Create(new RedisValue[] { first, second });
 
     /// <summary>Answers every evaluation of <paramref name="script"/> with <paramref name="responder"/>.</summary>
