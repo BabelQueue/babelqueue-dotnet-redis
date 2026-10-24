@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-24
+
 ### Added
 
 - **Zset layout (opt-in):** `RedisLayout.Zset` on `RedisConsumerOptions.Layout` / `RedisPublisherOptions.Layout` speaks Laravel's sorted-set queue (`queues:<name>`, `:delayed`, `:reserved`, `:notify`) with Laravel's Lua pop / release / migrate scripts (ADR-0033 §1). Options: `KeyPrefix`, `RetryAfter`, `MigrationBatchSize`. `RedisPublisher.PublishDelayedAsync` (zset only) parks a message on `:delayed`.
