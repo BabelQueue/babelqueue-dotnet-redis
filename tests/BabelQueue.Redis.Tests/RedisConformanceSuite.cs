@@ -133,8 +133,14 @@ internal static class RedisConformanceSuite
     {
         var db = RedisLive.Database();
         var layout = c.GetProperty("layout").GetString() == "zset" ? RedisLayout.Zset : RedisLayout.Legacy;
-        var retryAfterElement = c.GetProperty("retry_after");
-        TimeSpan? retryAfter = retryAfterElement.ValueKind == JsonValueKind.Null ? null : TimeSpan.FromSeconds(retryAfterElement.GetDouble());
+        // `retry_after` is absent on the delayed_score cases (a publish never reads it): fall back to the
+        // transport default. An explicit JSON null still means "disabled" (retry_after_null block).
+        TimeSpan? retryAfter = TimeSpan.FromSeconds(90);
+        if (c.TryGetProperty("retry_after", out var retryAfterElement))
+        {
+            retryAfter = retryAfterElement.ValueKind == JsonValueKind.Null ? null : TimeSpan.FromSeconds(retryAfterElement.GetDouble());
+        }
+
         var batch = c.TryGetProperty("migration_batch_size", out var b) ? b.GetInt32() : -1;
         var queueName = c.GetProperty("queue").GetString()! + "-" + Guid.NewGuid().ToString("N")[..10];
 
