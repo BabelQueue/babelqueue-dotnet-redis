@@ -18,18 +18,20 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ### Fixed
 
+- An unmapped URN with no `OnUnknownUrn` hook, or an envelope that fails `Accepts`, was never settled: it lapsed after `RetryAfter` and redelivered forever (zset `attempts` grew unbounded). It is now reported to `OnError` and dead-lettered through the same gated, atomic script as a poison element, in both layouts. An unknown URN gets an annotated record (`dead_letter.reason = "unknown_urn"`, `original_queue`, `attempts`, `lang: "dotnet"`; the legacy header frame is kept); a non-conformant envelope is written byte for byte. The `OnUnknownUrn` hook still acks without a DLQ write. The poison DLQ record format is unchanged.
 - `RedisConsumerOptions.IdleDelay` is clamped to 1 s (`RedisConsumerOptions.MaxIdleDelay`), the ADR-0033 section 10 cap; negative values become zero.
 - The conformance test project did not copy `conformance/CONFORMANCE_VERSION` to its output directory, so the live `results.json` run (`RedisConformanceSuite`) would have thrown `FileNotFoundException` on a runner with Redis.
 - `release.yml` now writes `results.json` (`BQ_CONFORMANCE_RESULTS`) and attaches it to the GitHub release (ADR-0032).
 
 ### Docs
 
-- README: a non-conformant envelope or an unmapped URN without `OnUnknownUrn` is only reported to `OnError` and redelivered every `retry_after` (zset `attempts` grows unbounded). Unchanged behaviour, now documented.
+- README: documents the unknown-URN / non-conformant dead-letter behaviour above.
 
 - README: zset reservations are keyed by the job body, so byte-identical elements (notably identical poison copies handled concurrently) share one `:reserved` member and only one reaches the DLQ (ADR-0033 §12 contract limit, broker-bindings §1.7).
 
 ### Tests
 
+- Unit tests (both layouts): unknown URN and `Accepts == false` write the DLQ record via the gated script and never ack; legacy header frame preserved; the `OnUnknownUrn` hook acks without a DLQ write; an expired reservation warns instead of writing; custom `DeadLetterKey` honoured.
 - Live tests: late ack leaves the redelivered copy alone and the third worker cleans up; identical zset copies collapse into one reservation member (asserted outside the handler, `OnError` empty); identical poison copies: only one DLQ move wins; a `RetryAfter = null` consumer still sweeps a foreign expired member and then reserves it (broker-bindings section 1.7); null-mode acks raise no `OnWarning`; the release test compares against a literal expected body (not `RedisReleaseBody.Build`).
 
 ### Limits

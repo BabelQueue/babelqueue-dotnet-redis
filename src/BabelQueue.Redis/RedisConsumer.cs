@@ -25,6 +25,11 @@ namespace BabelQueue.Redis;
 /// Header frames are not carried on this layout (the <c>__bq_frame</c> key is forbidden there).
 /// </para>
 /// <para>
+/// A non-conformant envelope (raw element) and an unmapped URN with no <see cref="RedisConsumerOptions.OnUnknownUrn"/>
+/// hook (the envelope plus a <c>dead_letter</c> block, <c>reason: unknown_urn</c>) are moved to the dead-letter list
+/// and their reservation is acked in the same script.
+/// </para>
+/// <para>
 /// The loop never stops on a bad message — observe it via the option hooks. A handler that keeps failing on a
 /// message that is released or recovered will redeliver it indefinitely; bound it with the handler or move it
 /// aside with <see cref="RedisConsumerOptions.OnError"/>.
@@ -34,6 +39,7 @@ public sealed class RedisConsumer
 {
     private const int InitialIdleMilliseconds = 100;
 
+    private readonly string _queue;
     private readonly RedisQueue _engine;
     private readonly IReadOnlyDictionary<string, BabelHandler> _handlers;
     private readonly RedisConsumerOptions _options;
@@ -57,6 +63,7 @@ public sealed class RedisConsumer
         ArgumentNullException.ThrowIfNull(database);
         ArgumentException.ThrowIfNullOrEmpty(queue);
         ArgumentNullException.ThrowIfNull(handlers);
+        _queue = queue;
         _handlers = handlers;
         _options = options ?? new RedisConsumerOptions();
         _engine = new RedisQueue(
@@ -168,6 +175,11 @@ public sealed class RedisConsumer
             _options.OnError?.Invoke(
                 new BabelQueueException("Rejected a non-conformant BabelQueue envelope from Redis."),
                 envelope, body);
+
+            // Never best-effort re-encoded (an unsupported schema is not parsed): the raw element, as stored,
+            // goes to the dead-letter list — the same record a poison element gets.
+            await DeadLetterAsync(reservation, reservation.HandlerBody, "non-conformant envelope moved to the dead-letter list")
+                .ConfigureAwait(false);
             return;
         }
 
@@ -181,7 +193,15 @@ public sealed class RedisConsumer
             }
             else
             {
-                _options.OnError?.Invoke(new UnknownUrnException(urn), envelope, body);
+                var error = new UnknownUrnException(urn);
+                _options.OnError?.Invoke(error, envelope, body);
+
+                // error-handling.md section 6: an unroutable message is dead-lettered (reason unknown_urn), not
+                // left to lapse and redeliver forever.
+                await DeadLetterAsync(
+                    reservation,
+                    UnknownUrnRecord(envelope, headers, error, reservation),
+                    "unknown URN moved to the dead-letter list").ConfigureAwait(false);
             }
 
             return;
@@ -208,12 +228,44 @@ public sealed class RedisConsumer
         await AckAsync(reservation).ConfigureAwait(false);
     }
 
-    private async Task DeadLetterPoisonAsync(RedisReservation reservation)
+    private Task DeadLetterPoisonAsync(RedisReservation reservation)
+        => DeadLetterAsync(reservation, reservation.HandlerBody, "poison element moved to the dead-letter list");
+
+    private async Task DeadLetterAsync(RedisReservation reservation, RedisValue body, string movedWarning)
     {
-        var moved = await _engine.DeadLetterAsync(reservation, reservation.HandlerBody).ConfigureAwait(false);
-        _options.OnWarning?.Invoke(moved
-            ? "poison element moved to the dead-letter list"
-            : RedisQueue.ExpiredWarning);
+        var moved = await _engine.DeadLetterAsync(reservation, body).ConfigureAwait(false);
+        _options.OnWarning?.Invoke(moved ? movedWarning : RedisQueue.ExpiredWarning);
+    }
+
+    /// <summary>
+    /// The DLQ record of an unmapped URN (ADR-0009): the original envelope plus the additive <c>dead_letter</c>
+    /// block (<c>reason: unknown_urn</c>, <c>original_queue</c>, <c>attempts</c>, <c>lang: dotnet</c>). On the
+    /// legacy layout the header frame is carried over so <c>traceparent</c> survives; if the envelope cannot be
+    /// re-encoded the raw element is dead-lettered instead — the message is never lost.
+    /// </summary>
+    private RedisValue UnknownUrnRecord(
+        Envelope envelope,
+        IReadOnlyDictionary<string, string> headers,
+        UnknownUrnException error,
+        RedisReservation reservation)
+    {
+        try
+        {
+            var dead = DeadLetters.Annotate(
+                envelope,
+                "unknown_urn",
+                _queue,
+                error: error.Message,
+                exception: typeof(UnknownUrnException).FullName);
+            var encoded = EnvelopeCodec.Encode(dead);
+            return _engine.Layout == RedisLayout.Legacy ? RedisFrame.FrameValue(encoded, headers) : encoded;
+        }
+#pragma warning disable CA1031 // A record that cannot be built must not strand the message.
+        catch (Exception)
+#pragma warning restore CA1031
+        {
+            return reservation.HandlerBody;
+        }
     }
 
     private async Task AckAsync(RedisReservation reservation)

@@ -159,34 +159,118 @@ public sealed class RedisConsumerTests
     }
 
     [Fact]
-    public async Task NonConformantEnvelopeReportsOnErrorAndLeavesReserved()
+    public async Task NonConformantEnvelopeIsReportedAndDeadLetteredRawWithoutAnAck()
     {
-        var db = Reserving("{\"not\":\"an envelope\"}");
+        const string raw = "{\"not\":\"an envelope\"}";
+        var db = Reserving(raw);
         Exception? captured = null;
-        var options = new RedisConsumerOptions { OnError = (e, _, _) => captured = e };
+        var warnings = new List<string>();
+        var options = new RedisConsumerOptions { OnError = (e, _, _) => captured = e, OnWarning = warnings.Add };
 
         await Consumer(db, null, options).PollAsync();
 
         Assert.IsType<BabelQueueException>(captured);
+        var dlq = Assert.Single(db.Of(RedisScripts.LegacyDeadLetter));
+        Assert.Equal(new[] { Processing, Deadlines, "orders.dlq" }, dlq.Keys);
+        Assert.Equal(raw, (string)dlq.Values[1]!);
+        Assert.Equal(raw, (string)dlq.Values[2]!);
+        Assert.Matches("^[0-9a-f]{32}$", (string)dlq.Values[0]!);
         Assert.Empty(db.Of(RedisScripts.LegacyAck));
+        Assert.Equal(new[] { "non-conformant envelope moved to the dead-letter list" }, warnings);
     }
 
     [Fact]
-    public async Task UnknownUrnWithHookAcksAndReportsWithoutHook()
+    public async Task UnsupportedSchemaVersionIsDeadLetteredByteForByte()
     {
-        var withHook = Reserving(Envelope());
-        string? unknown = null;
-        var optionsA = new RedisConsumerOptions { OnUnknownUrn = (env, _, _) => { unknown = EnvelopeCodec.Urn(env); return Task.CompletedTask; } };
-        await Consumer(withHook, null, optionsA).PollAsync();
-        Assert.Equal("urn:babel:orders:created", unknown);
-        Assert.Single(withHook.Of(RedisScripts.LegacyAck));
+        var raw = Envelope().Replace("\"schema_version\":1", "\"schema_version\":99", StringComparison.Ordinal);
+        Assert.Contains("\"schema_version\":99", raw, StringComparison.Ordinal);
+        var db = Reserving(raw);
 
-        var noHook = Reserving(Envelope());
+        await Consumer(db, Handlers((_, _, _, _) => Task.CompletedTask)).PollAsync();
+
+        var dlq = Assert.Single(db.Of(RedisScripts.LegacyDeadLetter));
+        Assert.Equal(raw, (string)dlq.Values[2]!);
+    }
+
+    [Fact]
+    public async Task UnknownUrnWithHookAcksAndNeverDeadLetters()
+    {
+        var db = Reserving(Envelope());
+        string? unknown = null;
+        var options = new RedisConsumerOptions { OnUnknownUrn = (env, _, _) => { unknown = EnvelopeCodec.Urn(env); return Task.CompletedTask; } };
+
+        await Consumer(db, null, options).PollAsync();
+
+        Assert.Equal("urn:babel:orders:created", unknown);
+        Assert.Single(db.Of(RedisScripts.LegacyAck));
+        Assert.Empty(db.Of(RedisScripts.LegacyDeadLetter));
+    }
+
+    [Fact]
+    public async Task UnknownUrnWithoutHookIsDeadLetteredWithAnUnknownUrnBlockAndNotAcked()
+    {
+        var original = Envelope(attempts: 2);
+        var db = Reserving(original);
         Exception? captured = null;
-        var optionsB = new RedisConsumerOptions { OnError = (e, _, _) => captured = e };
-        await Consumer(noHook, null, optionsB).PollAsync();
+        var warnings = new List<string>();
+        var options = new RedisConsumerOptions { OnError = (e, _, _) => captured = e, OnWarning = warnings.Add };
+
+        await Consumer(db, null, options).PollAsync();
+
         Assert.IsType<UnknownUrnException>(captured);
-        Assert.Empty(noHook.Of(RedisScripts.LegacyAck));
+        Assert.Empty(db.Of(RedisScripts.LegacyAck));
+        var dlq = Assert.Single(db.Of(RedisScripts.LegacyDeadLetter));
+        Assert.Equal(new[] { Processing, Deadlines, "orders.dlq" }, dlq.Keys);
+        Assert.Equal(original, (string)dlq.Values[1]!);
+
+        var record = EnvelopeCodec.Decode((string)dlq.Values[2]!);
+        var dead = record.DeadLetter!;
+        Assert.Equal("unknown_urn", dead.Reason);
+        Assert.Equal(Queue, dead.OriginalQueue);
+        Assert.Equal(2, dead.Attempts);
+        Assert.Equal("dotnet", dead.Lang);
+        Assert.Equal(typeof(UnknownUrnException).FullName, dead.Exception);
+        var source = EnvelopeCodec.Decode(original);
+        Assert.Equal(source.Meta!.Id, record.Meta!.Id);
+        Assert.Equal(source.TraceId, record.TraceId);
+        Assert.Equal(new[] { "unknown URN moved to the dead-letter list" }, warnings);
+    }
+
+    [Fact]
+    public async Task UnknownUrnDeadLetterRecordKeepsTheHeaderFrame()
+    {
+        var headers = new Dictionary<string, string> { ["traceparent"] = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01" };
+        var framed = RedisFrame.FrameValue(Envelope(), headers);
+        var db = Reserving(framed);
+
+        await Consumer(db).PollAsync();
+
+        var dlq = Assert.Single(db.Of(RedisScripts.LegacyDeadLetter));
+        Assert.Equal(framed, (string)dlq.Values[1]!);
+        var (body, carried) = RedisFrame.Unframe((string)dlq.Values[2]!);
+        Assert.Equal(headers, carried);
+        Assert.Equal("unknown_urn", EnvelopeCodec.Decode(body).DeadLetter!.Reason);
+    }
+
+    [Fact]
+    public async Task UnknownUrnWhoseReservationExpiredWarnsInsteadOfWriting()
+    {
+        var db = Reserving(Envelope()).On(RedisScripts.LegacyDeadLetter, _ => ScriptDb.Integer(0));
+        var warnings = new List<string>();
+
+        await Consumer(db, null, new RedisConsumerOptions { OnWarning = warnings.Add }).PollAsync();
+
+        Assert.Equal(new[] { RedisQueue.ExpiredWarning }, warnings);
+    }
+
+    [Fact]
+    public async Task UnknownUrnUsesTheConfiguredDeadLetterKey()
+    {
+        var db = Reserving(Envelope());
+
+        await Consumer(db, null, new RedisConsumerOptions { DeadLetterKey = "custom.dlq" }).PollAsync();
+
+        Assert.Equal("custom.dlq", Assert.Single(db.Of(RedisScripts.LegacyDeadLetter)).Keys[2]);
     }
 
     [Fact]

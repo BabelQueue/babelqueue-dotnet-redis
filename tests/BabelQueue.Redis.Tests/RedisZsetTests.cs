@@ -231,15 +231,52 @@ public sealed class RedisZsetTests
     }
 
     [Fact]
-    public async Task UnknownUrnWithoutFallbackStaysReservedAndReports()
+    public async Task UnknownUrnWithoutFallbackIsReportedAndDeadLetteredWithAnUnknownUrnBlock()
     {
-        var db = Reserving(Delivered(Body()));
+        var raw = Body(attempts: 1);
+        var db = Reserving(Delivered(raw));
         var errors = new List<Exception>();
 
         await Consumer(db, null, Zset(o => o.OnError = (e, _, _) => errors.Add(e))).PollAsync();
 
         Assert.IsType<UnknownUrnException>(Assert.Single(errors));
         Assert.Empty(db.SortedRemoves);
+        var dlq = Assert.Single(db.Of(RedisScripts.ZsetDeadLetter));
+        Assert.Equal(new[] { "queues:orders:reserved", "queues:orders.dlq", "queues:orders.dlq:notify" }, dlq.Keys);
+        Assert.Equal(RedisReleaseBody.Build(raw), (string)dlq.Values[0]!);
+
+        var dead = EnvelopeCodec.Decode((string)dlq.Values[1]!);
+        Assert.Equal("unknown_urn", dead.DeadLetter!.Reason);
+        Assert.Equal("orders", dead.DeadLetter.OriginalQueue);
+        Assert.Equal(2, dead.DeadLetter.Attempts);
+        Assert.Equal("dotnet", dead.DeadLetter.Lang);
+        Assert.DoesNotContain("__bq_frame", (string)dlq.Values[1]!, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task NonConformantEnvelopeIsDeadLetteredRawAndNeverAcked()
+    {
+        const string raw = "{\"not\":\"an envelope\"}";
+        var db = Reserving(Delivered(raw, raw + " "));
+        var warnings = new List<string>();
+
+        await Consumer(db, null, Zset(o => o.OnWarning = warnings.Add)).PollAsync();
+
+        var dlq = Assert.Single(db.Of(RedisScripts.ZsetDeadLetter));
+        Assert.Equal(raw, (string)dlq.Values[1]!);
+        Assert.Empty(db.SortedRemoves);
+        Assert.Equal(new[] { "non-conformant envelope moved to the dead-letter list" }, warnings);
+    }
+
+    [Fact]
+    public async Task UnknownUrnWhoseReservationExpiredWarnsInsteadOfWriting()
+    {
+        var db = Reserving(Delivered(Body())).On(RedisScripts.ZsetDeadLetter, _ => ScriptDb.Integer(0));
+        var warnings = new List<string>();
+
+        await Consumer(db, null, Zset(o => o.OnWarning = warnings.Add)).PollAsync();
+
+        Assert.Equal(new[] { RedisQueue.ExpiredWarning }, warnings);
     }
 
     [Fact]
@@ -252,6 +289,7 @@ public sealed class RedisZsetTests
 
         Assert.Equal(1, seen);
         Assert.Single(db.SortedRemoves);
+        Assert.Empty(db.Of(RedisScripts.ZsetDeadLetter));
     }
 
     [Fact]

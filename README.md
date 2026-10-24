@@ -69,7 +69,8 @@ stores the bare envelope byte-for-byte.)
 Reservation follows the **reliable-queue** pattern (mirroring the Go reference): the head of
 the queue is atomically moved onto a per-queue `<queue>:processing` list, then removed on
 ack. A throwing handler leaves the element on the processing list (at-least-once); the poll
-loop never stops on a bad message — observe via `OnError` / `OnUnknownUrn`. The envelope is
+loop never stops on a bad message — observe via `OnError` / `OnUnknownUrn`; an unroutable message
+is dead-lettered (see below). The envelope is
 unchanged (`schema_version` stays `1`); Redis support is purely additive.
 
 > **Reliable-queue scope.** The default (`RedisLayout.Legacy`) is a **.NET-owned reliable queue**:
@@ -108,13 +109,19 @@ Limits of the zset layout:
 
 Messages that cannot be routed (both layouts):
 
-- A non-conformant envelope (`Accepts == false`) and an unmapped URN with no `OnUnknownUrn` hook only
-  invoke `OnError`; they are **not** acked and **not** dead-lettered. The reservation then lapses and the
-  message is redelivered every `RetryAfter` (legacy: the sweep returns it to the ready list; zset: the
-  migrate step does, and `attempts` grows on every round with no upper bound). ADR-0033 section 9 only accepts
-  the crash loop (a message that kills its consumer, since recovery does not bump `attempts`); whether
-  rejected or unroutable messages should loop is an open decision. Give such messages a home with an
-  `OnUnknownUrn` hook (or a handler for the URN), and alert on `OnError`.
+- An unmapped URN with no `OnUnknownUrn` hook invokes `OnError` and is then **dead-lettered**: the envelope
+  goes to `<queue>.dlq` (`DeadLetterKey`) with a `dead_letter` block (`reason: "unknown_urn"`, `error`,
+  `exception`, `original_queue`, `attempts`, `lang: "dotnet"`, `failed_at`) and the reservation is removed in
+  the same gated Lua step (legacy: `LREM` + deadline `ZREM` + `RPUSH`; zset: `ZREM :reserved` + `RPUSH`, same
+  scripts as a poison element). Legacy keeps the `traceparent` header frame around the DLQ record; the zset
+  layout stores the bare record. It no longer loops. If the reservation already expired, nothing is written
+  and `OnWarning` reports `reservation expired`.
+- A non-conformant envelope (`Accepts == false`, e.g. an unsupported `schema_version`) invokes `OnError` and is
+  dead-lettered **byte for byte** (it is never parsed or re-encoded, so no `dead_letter` block is added),
+  exactly like a poison element; the reservation is removed atomically.
+- An `OnUnknownUrn` hook takes precedence: it runs, then the message is acked and **not** dead-lettered. There
+  is no switch to turn the Redis DLQ off (a poison element is always dead-lettered too); point `DeadLetterKey`
+  at the queue you want.
 - Zset layout only: the `:reserved` member is the (re-encoded) job body itself (ADR-0033 section 3), so
   byte-identical elements share **one** reservation. If two workers hold identical copies at the same
   time, the first ack / dead-letter wins and the other finds the reservation gone (`reservation expired`

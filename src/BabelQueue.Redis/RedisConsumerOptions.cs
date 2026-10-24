@@ -77,11 +77,12 @@ public sealed class RedisConsumerOptions
 
     /// <summary>
     /// Called for a non-conformant envelope, an unmapped URN (with no
-    /// <see cref="OnUnknownUrn"/>), or a throwing handler. The poll loop never stops.
+    /// <see cref="OnUnknownUrn"/>), or a throwing handler. The first two are then dead-lettered;
+    /// the poll loop never stops.
     /// </summary>
     public Action<Exception, Envelope, string>? OnError { get; set; }
 
-    /// <summary>Called instead of erroring when a URN has no handler; the message is then acked (removed).</summary>
+    /// <summary>Called instead of erroring when a URN has no handler; the message is then acked (removed), not dead-lettered.</summary>
     public Func<Envelope, string, CancellationToken, Task>? OnUnknownUrn { get; set; }
 
     /// <summary>

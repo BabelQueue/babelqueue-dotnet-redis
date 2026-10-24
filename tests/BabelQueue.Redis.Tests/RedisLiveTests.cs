@@ -255,6 +255,22 @@ public sealed class RedisLiveTests : IDisposable
     }
 
     [LiveFact]
+    public async Task ZsetUnknownUrnIsDeadLetteredAndLeavesNothingReserved()
+    {
+        await ZsetPublisher().PublishAsync(Urn, new Dictionary<string, object?> { ["order_id"] = 1 });
+        var errors = new List<Exception>();
+
+        Assert.Equal(1, await Zset(new Dictionary<string, BabelHandler>(), o => o.OnError = (e, _, _) => errors.Add(e)).PollAsync());
+
+        Assert.Single(errors);
+        var dead = Assert.Single(await _db.ListRangeAsync("queues:" + _queue + ".dlq"));
+        using var doc = JsonDocument.Parse((string)dead!);
+        Assert.Equal("unknown_urn", doc.RootElement.GetProperty("dead_letter").GetProperty("reason").GetString());
+        Assert.Equal(1, await _db.ListLengthAsync("queues:" + _queue + ".dlq"));
+        Assert.Equal(0, await _db.SortedSetLengthAsync("queues:" + _queue + ":reserved"));
+    }
+
+    [LiveFact]
     public async Task ZsetRetryAfterNullAckDoesNotWarn()
     {
         await ZsetPublisher().PublishAsync(Urn, null);
@@ -294,6 +310,23 @@ public sealed class RedisLiveTests : IDisposable
         Assert.Equal(1, await Legacy(Collect(seen)).PollAsync());
 
         Assert.Single(seen);
+        Assert.Equal(0, await _db.ListLengthAsync(_queue + ":processing"));
+        Assert.Equal(0, await _db.SortedSetLengthAsync(_queue + ":processing:deadlines"));
+    }
+
+    [LiveFact]
+    public async Task LegacyUnknownUrnIsDeadLetteredAndLeavesNothingProcessing()
+    {
+        await new RedisPublisher(_db, _queue).PublishAsync(Urn, new Dictionary<string, object?> { ["order_id"] = 1 });
+        var errors = new List<Exception>();
+
+        Assert.Equal(1, await Legacy(new Dictionary<string, BabelHandler>(), o => o.OnError = (e, _, _) => errors.Add(e)).PollAsync());
+
+        Assert.Single(errors);
+        var dead = Assert.Single(await _db.ListRangeAsync(_queue + ".dlq"));
+        using var doc = JsonDocument.Parse((string)dead!);
+        Assert.Equal("unknown_urn", doc.RootElement.GetProperty("dead_letter").GetProperty("reason").GetString());
+        Assert.Equal(1, await _db.ListLengthAsync(_queue + ".dlq"));
         Assert.Equal(0, await _db.ListLengthAsync(_queue + ":processing"));
         Assert.Equal(0, await _db.SortedSetLengthAsync(_queue + ":processing:deadlines"));
     }
