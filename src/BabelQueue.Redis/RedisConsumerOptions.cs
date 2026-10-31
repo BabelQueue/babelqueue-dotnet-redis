@@ -90,4 +90,14 @@ public sealed class RedisConsumerOptions
     /// release on a reservation that already expired ("reservation expired" — not an error).
     /// </summary>
     public Action<string>? OnWarning { get; set; }
+
+    /// <summary>
+    /// Optional hook called once per element this consumer <b>moved</b> to the dead-letter list, after the move is
+    /// confirmed (ADR-0039 section 5.1): a poison element or a non-conformant envelope (<c>reason</c> <c>poison</c>) and an
+    /// unmapped URN with no <see cref="OnUnknownUrn"/> hook (<c>unknown_urn</c>). It is not called when the reservation had
+    /// already expired (nothing is written). An exception it throws is caught and logged by
+    /// <see cref="DeadLetterObservers.NotifySafely"/> and never changes the settle outcome. <c>null</c> (the default)
+    /// changes nothing; <see cref="Tracing.MetricsDeadLetterObserver"/> counts <c>babelqueue.dlq.messages</c>.
+    /// </summary>
+    public IDeadLetterObserver? DeadLetterObserver { get; set; }
 }

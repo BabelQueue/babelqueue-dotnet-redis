@@ -9,6 +9,16 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+
+- **Dead-letter observer (ADR-0039 section 5.1).** New `RedisConsumerOptions.DeadLetterObserver` (`BabelQueue.IDeadLetterObserver`
+  from `BabelQueue.Core`, e.g. `MetricsDeadLetterObserver`, which counts `babelqueue.dlq.messages`). It is called once per
+  element the consumer **moved** to the dead-letter list, after the move is confirmed: a poison element or non-conformant
+  envelope (`reason` `poison`) and an unmapped URN with no `OnUnknownUrn` hook (`unknown_urn`, `Queue` = `meta.queue`).
+  `DeadLetterQueue` is the dead-letter list key. It is not called when the reservation had already expired (nothing is
+  written). An exception the observer throws is caught and logged and never changes the settle outcome. `null` (the default)
+  changes nothing. Needs a `BabelQueue.Core` release that ships `IDeadLetterObserver`; no wire change (`schema_version: 1`).
+
 ## [1.2.0] - 2026-10-24
 
 ### Added
