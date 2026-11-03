@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-03
+
 ### Added
 
 - **Dead-letter observer (ADR-0039 section 5.1).** New `RedisConsumerOptions.DeadLetterObserver` (`BabelQueue.IDeadLetterObserver`
@@ -18,6 +20,10 @@ The envelope wire format is versioned separately by `meta.schema_version`
   `DeadLetterQueue` is the dead-letter list key. It is not called when the reservation had already expired (nothing is
   written). An exception the observer throws is caught and logged and never changes the settle outcome. `null` (the default)
   changes nothing. Needs a `BabelQueue.Core` release that ships `IDeadLetterObserver`; no wire change (`schema_version: 1`).
+
+### Changed
+
+- `BabelQueue.Core` dependency raised from `1.13.0` to `1.14.0` (`IDeadLetterObserver`).
 
 ## [1.2.0] - 2026-10-24
 
