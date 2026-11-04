@@ -192,7 +192,9 @@ public sealed class RedisConsumer
             await DeadLetterAsync(
                 reservation,
                 PoisonRecordFor(reservation, Encoding.UTF8.GetBytes(body)),
-                "non-conformant envelope moved to the dead-letter list").ConfigureAwait(false);
+                "non-conformant envelope moved to the dead-letter list",
+                "poison",
+                string.Empty).ConfigureAwait(false);
             return;
         }
 
@@ -214,7 +216,9 @@ public sealed class RedisConsumer
                 await DeadLetterAsync(
                     reservation,
                     UnknownUrnRecord(envelope, headers, error, reservation),
-                    "unknown URN moved to the dead-letter list").ConfigureAwait(false);
+                    "unknown URN moved to the dead-letter list",
+                    "unknown_urn",
+                    envelope.Meta?.Queue ?? string.Empty).ConfigureAwait(false);
             }
 
             return;
@@ -242,7 +246,12 @@ public sealed class RedisConsumer
     }
 
     private Task DeadLetterPoisonAsync(RedisReservation reservation)
-        => DeadLetterAsync(reservation, PoisonRecordFor(reservation, PoisonBodyBytes(reservation)), "poison element moved to the dead-letter list");
+        => DeadLetterAsync(
+            reservation,
+            PoisonRecordFor(reservation, PoisonBodyBytes(reservation)),
+            "poison element moved to the dead-letter list",
+            "poison",
+            string.Empty);
 
     /// <summary>
     /// The bytes of a poison element as the DLQ record carries them: the stored element, with a legacy header frame
@@ -302,10 +311,44 @@ public sealed class RedisConsumer
         }
     }
 
-    private async Task DeadLetterAsync(RedisReservation reservation, RedisValue body, string movedWarning)
+    /// <summary>
+    /// Moves the reservation to the dead-letter list. Only when the move happened (the reservation had not expired) the
+    /// optional <see cref="RedisConsumerOptions.DeadLetterObserver"/> is told, once, with <paramref name="reason"/> and the
+    /// source queue (<paramref name="sourceQueue"/>, else the consumer's queue); an expired reservation writes nothing and
+    /// is not reported (ADR-0039 section 5.1).
+    /// </summary>
+    private async Task DeadLetterAsync(
+        RedisReservation reservation, RedisValue body, string movedWarning, string reason, string sourceQueue)
     {
         var moved = await _engine.DeadLetterAsync(reservation, body).ConfigureAwait(false);
         _options.OnWarning?.Invoke(moved ? movedWarning : RedisQueue.ExpiredWarning);
+        if (moved && _options.DeadLetterObserver is { } observer)
+        {
+            observer.NotifySafely(new DeadLetterEvent(
+                IsBlankQueue(sourceQueue) ? _queue : sourceQueue, _engine.DeadLetter, reason));
+        }
+    }
+
+    /// <summary>
+    /// Blank in the shared cross-SDK sense (ADR-0031): empty or only ASCII whitespace (space, <c>\t</c>, <c>\n</c>, U+000B,
+    /// <c>\f</c>, <c>\r</c>) -- not <see cref="string.IsNullOrWhiteSpace"/>, which also counts Unicode spaces.
+    /// </summary>
+    private static bool IsBlankQueue(string? value)
+    {
+        if (value is null)
+        {
+            return true;
+        }
+
+        foreach (var c in value)
+        {
+            if (c != ' ' && (c < '\t' || c > '\r'))
+            {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     /// <summary>

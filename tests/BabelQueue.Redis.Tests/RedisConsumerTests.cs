@@ -491,6 +491,164 @@ public sealed class RedisConsumerTests
         Assert.Matches(new Regex("^[0-9a-f]{32}$"), RedisQueueAccess.NewToken());
     }
 
+    // ---- ADR-0039 section 5.1: dead-letter observer ----
+
+    private sealed class RecordingObserver : IDeadLetterObserver
+    {
+        public List<DeadLetterEvent> Events { get; } = new();
+
+        public bool Throw { get; init; }
+
+        public void OnDeadLetter(DeadLetterEvent deadLetterEvent)
+        {
+            Events.Add(deadLetterEvent);
+            if (Throw)
+            {
+                throw new InvalidOperationException("observer failure");
+            }
+        }
+    }
+
+    private static ScriptDb ReservingBytes(byte[] stored)
+        => new ScriptDb()
+            .Queue(RedisScripts.LegacyReserve, ScriptDb.Bytes(stored))
+            .On(RedisScripts.LegacyAck, _ => ScriptDb.Integer(1))
+            .On(RedisScripts.LegacyRelease, _ => ScriptDb.Integer(1))
+            .On(RedisScripts.LegacyDeadLetter, _ => ScriptDb.Integer(1))
+            .On(RedisScripts.LegacySweep, _ => ScriptDb.Integer(0));
+
+    [Fact]
+    public async Task ObserverIsCalledOnceForAPoisonElement()
+    {
+        var observer = new RecordingObserver();
+        var db = ReservingBytes(BadUtf8Envelope());
+
+        await Consumer(db, null, new RedisConsumerOptions { DeadLetterObserver = observer }).PollAsync();
+
+        Assert.Single(db.Of(RedisScripts.LegacyDeadLetter));
+        Assert.Equal(new DeadLetterEvent(Queue, "orders.dlq", "poison"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceForANonConformantEnvelope()
+    {
+        var observer = new RecordingObserver();
+        var db = Reserving("{\"not\":\"an envelope\"}");
+
+        await Consumer(db, null, new RedisConsumerOptions { DeadLetterObserver = observer }).PollAsync();
+
+        Assert.Single(db.Of(RedisScripts.LegacyDeadLetter));
+        Assert.Equal(new DeadLetterEvent(Queue, "orders.dlq", "poison"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverIsCalledOnceForAnUnknownUrnWithTheConfiguredDeadLetterKey()
+    {
+        var observer = new RecordingObserver();
+        var db = Reserving(Envelope());
+        var options = new RedisConsumerOptions { DeadLetterKey = "custom.dlq", DeadLetterObserver = observer };
+
+        await Consumer(db, null, options).PollAsync();
+
+        Assert.Equal(new DeadLetterEvent(Queue, "custom.dlq", "unknown_urn"), Assert.Single(observer.Events));
+    }
+
+    private static string EnvelopeFor(string queue)
+        => Envelope().Replace("\"queue\":\"orders\"", "\"queue\":\"" + queue + "\"", StringComparison.Ordinal);
+
+    [Fact]
+    public async Task UnknownUrnEventCarriesTheEnvelopeQueueNotTheConsumerQueue()
+    {
+        var body = EnvelopeFor("billing");
+        Assert.Contains("\"queue\":\"billing\"", body, StringComparison.Ordinal);
+        var observer = new RecordingObserver();
+        var db = Reserving(body);
+
+        await Consumer(db, null, new RedisConsumerOptions { DeadLetterObserver = observer }).PollAsync();
+
+        Assert.Equal(new DeadLetterEvent("billing", "orders.dlq", "unknown_urn"), Assert.Single(observer.Events));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("  ")]
+    [InlineData("\\t\\n")]
+    public async Task UnknownUrnEventFallsBackToTheConsumerQueueWhenMetaQueueIsBlank(string blank)
+    {
+        var observer = new RecordingObserver();
+        var db = Reserving(EnvelopeFor(blank));
+
+        await Consumer(db, null, new RedisConsumerOptions { DeadLetterObserver = observer }).PollAsync();
+
+        Assert.Equal("orders", Assert.Single(observer.Events).Queue);
+    }
+
+    [Fact]
+    public async Task NonConformantEventCarriesTheConsumerQueueEvenWhenTheBodyNamesAnother()
+    {
+        var raw = EnvelopeFor("billing").Replace("\"schema_version\":1", "\"schema_version\":99", StringComparison.Ordinal);
+        Assert.Contains("\"schema_version\":99", raw, StringComparison.Ordinal);
+        var observer = new RecordingObserver();
+        var db = Reserving(raw);
+
+        await Consumer(db, null, new RedisConsumerOptions { DeadLetterObserver = observer }).PollAsync();
+
+        Assert.Equal(new DeadLetterEvent(Queue, "orders.dlq", "poison"), Assert.Single(observer.Events));
+    }
+
+    [Fact]
+    public async Task ObserverIsNotCalledWhenTheReservationExpiredAndNothingWasWritten()
+    {
+        var observer = new RecordingObserver();
+        foreach (var body in new[] { Envelope(), "{\"not\":\"an envelope\"}" })
+        {
+            var db = Reserving(body).On(RedisScripts.LegacyDeadLetter, _ => ScriptDb.Integer(0));
+            var warnings = new List<string>();
+
+            await Consumer(db, null, new RedisConsumerOptions { DeadLetterObserver = observer, OnWarning = warnings.Add }).PollAsync();
+
+            Assert.Equal(new[] { RedisQueue.ExpiredWarning }, warnings);
+        }
+
+        Assert.Empty(observer.Events);
+    }
+
+    [Fact]
+    public async Task ObserverIsNotCalledWhenTheUnknownUrnHookAcksInsteadOfDeadLettering()
+    {
+        var observer = new RecordingObserver();
+        var db = Reserving(Envelope());
+        var options = new RedisConsumerOptions
+        {
+            OnUnknownUrn = (_, _, _) => Task.CompletedTask,
+            DeadLetterObserver = observer,
+        };
+
+        await Consumer(db, null, options).PollAsync();
+
+        Assert.Empty(observer.Events);
+        Assert.Single(db.Of(RedisScripts.LegacyAck));
+    }
+
+    [Fact]
+    public async Task ThrowingObserverDoesNotChangeTheSettleOutcome()
+    {
+        var observer = new RecordingObserver { Throw = true };
+        var db = Reserving(Envelope(), "{\"not\":\"an envelope\"}");
+        var warnings = new List<string>();
+        var options = new RedisConsumerOptions { DeadLetterObserver = observer, OnWarning = warnings.Add };
+
+        var reserved = await Consumer(db, null, options).PollAsync();
+
+        Assert.Equal(2, reserved);
+        Assert.Equal(2, observer.Events.Count);
+        Assert.Equal(2, db.Of(RedisScripts.LegacyDeadLetter).Count());
+        Assert.Empty(db.Of(RedisScripts.LegacyAck));
+        Assert.Equal(
+            new[] { "unknown URN moved to the dead-letter list", "non-conformant envelope moved to the dead-letter list" },
+            warnings);
+    }
+
     internal static string RepoRoot()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
