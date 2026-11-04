@@ -3,12 +3,15 @@ name: Release
 on:
   push:
     tags: [ "v*" ]
+  workflow_dispatch:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   release:
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     # A real Redis: the Lua scripts and the redis_layout behavioural conformance blocks run for
     # real (BQ_REQUIRE_REDIS makes an unreachable broker fail the run instead of skipping).
@@ -40,10 +43,16 @@ jobs:
       - name: Pack
         run: dotnet pack src/BabelQueue.Redis/BabelQueue.Redis.csproj -c Release -o artifacts
 
+      - name: NuGet login (Trusted Publishing)
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+
       - name: Publish to NuGet
         run: >
           dotnet nuget push "artifacts/*.nupkg"
-          --api-key "${{ secrets.NUGET_API_KEY }}"
+          --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}"
           --source https://api.nuget.org/v3/index.json
           --skip-duplicate
 
@@ -53,3 +62,26 @@ jobs:
           generate_release_notes: true
           # The cross-SDK conformance results (ADR-0032) ride along as a release asset.
           files: ${{ runner.temp }}/results.json
+
+  # Manual dry run: exercises only the NuGet Trusted Publishing login (no test, pack, push
+  # or GitHub release), so the nuget.org policy can be verified without cutting a version.
+  verify-trusted-publishing:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: NuGet login (Trusted Publishing)
+        id: nuget-login
+        uses: NuGet/login@v1
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      - name: Verify the short-lived API key was issued
+        env:
+          KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
+        run: |
+          if [ -n "$KEY" ]; then
+            echo "Trusted Publishing login OK"
+          else
+            echo "Trusted Publishing login returned an empty API key" >&2
+            exit 1
+          fi
