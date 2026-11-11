@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-11
+
 ### Added
 
 - **`RedisPublisher.PublishEnvelopeAsync(envelope, headers, ...)`.** Sends an already-built `Envelope` exactly as given, with the bare / framed value and the optional out-of-band `headers`, and returns `meta.id`. Use it as the `send` callback of `Telemetry.PublishAsync(..., headers, env => publisher.PublishEnvelopeAsync(env, headers), queue)`: the producer span's `messaging.message.id` was the `meta.id` of the envelope `Telemetry` built, while `PublishWithHeadersAsync(urn, data, ...)` rebuilt a different one, so the span id never matched the wire. Now it does. `PublishWithHeadersAsync` and `PublishAsync` delegate to it; their behaviour is unchanged. Envelope unchanged (`schema_version` stays `1`); no new `BabelQueue.Core` requirement.
