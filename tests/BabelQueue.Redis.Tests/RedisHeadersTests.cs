@@ -1,6 +1,8 @@
+using System.Diagnostics;
 using System.Text.Json;
 using BabelQueue;
 using BabelQueue.Redis;
+using BabelQueue.Tracing;
 using Moq;
 using StackExchange.Redis;
 using Xunit;
@@ -198,5 +200,110 @@ public sealed class RedisHeadersTests
         Assert.NotNull(parent);
         Assert.Equal("0af7651916cd43dd8448eb211c80319c", parent!.Value.TraceId.ToHexString());
         Assert.Equal("b7ad6b7169203331", parent.Value.SpanId.ToHexString());
+    }
+
+    // O6: the envelope Telemetry.PublishAsync builds is the one that is sent, so the producer span's
+    // messaging.message.id is the meta.id on the wire (and the traceparent rides beside the envelope).
+    [Fact]
+    public async Task TelemetryPublishEnvelopeRecordsTheWireMessageId()
+    {
+        var (mock, pushed) = MockDatabase();
+        var publisher = new RedisPublisher(mock.Object, Queue);
+        const string envelopeUrn = "urn:babel:orders:envelope-id";
+        var activities = new List<Activity>();
+        using var listener = new ActivityListener
+        {
+            ShouldListenTo = source => source.Name == Telemetry.ActivitySourceName,
+            Sample = (ref ActivityCreationOptions<ActivityContext> _) => ActivitySamplingResult.AllData,
+            ActivityStopped = activity =>
+            {
+                if (activity.Kind == ActivityKind.Producer && Equals(activity.GetTagItem("babelqueue.urn"), envelopeUrn))
+                {
+                    lock (activities)
+                    {
+                        activities.Add(activity);
+                    }
+                }
+            },
+        };
+        ActivitySource.AddActivityListener(listener);
+
+        var headers = new Dictionary<string, string>();
+        var id = await Telemetry.PublishAsync(
+            envelopeUrn,
+            new Dictionary<string, object?> { ["order_id"] = 7 },
+            headers,
+            env => publisher.PublishEnvelopeAsync(env, headers),
+            "orders");
+
+        var producerSpan = Assert.Single(activities);
+        var stored = (string)pushed()!;
+        string body = stored;
+        string? traceparent = null;
+        using (var frame = JsonDocument.Parse(stored))
+        {
+            if (frame.RootElement.TryGetProperty("__bq_frame", out _))
+            {
+                body = frame.RootElement.GetProperty("body").GetString()!;
+                traceparent = frame.RootElement.GetProperty("headers").GetProperty("traceparent").GetString();
+            }
+        }
+        var wire = EnvelopeCodec.Decode(body);
+
+        Assert.Equal(id, wire.Meta!.Id);
+        Assert.Equal(wire.Meta.Id, producerSpan.GetTagItem("messaging.message.id"));
+        Assert.Equal(Telemetry.UuidOf(producerSpan.TraceId), wire.TraceId);
+        Assert.Equal(wire.TraceId, producerSpan.GetTagItem("messaging.message.conversation_id"));
+        Assert.Equal(EnvelopeCodec.SchemaVersion, wire.Meta.SchemaVersion);
+        Assert.Equal(headers["traceparent"], traceparent);
+        Assert.Contains(producerSpan.TraceId.ToHexString(), traceparent, StringComparison.Ordinal);
+        Assert.DoesNotContain("traceparent", body, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task PublishEnvelopeSendsTheGivenEnvelopeUnchanged()
+    {
+        var (mock, pushed) = MockDatabase();
+        var publisher = new RedisPublisher(mock.Object, Queue);
+        var made = EnvelopeCodec.Make(
+            "urn:babel:orders:created", new Dictionary<string, object?> { ["order_id"] = 7 }, "orders", "trace-fixed");
+        var envelope = made with
+        {
+            Extras = new Dictionary<string, JsonElement> { ["x_tenant"] = JsonSerializer.SerializeToElement("t1") },
+            Meta = made.Meta! with
+            {
+                Extras = new Dictionary<string, JsonElement> { ["x_region"] = JsonSerializer.SerializeToElement("eu") },
+            },
+        };
+
+        var id = await publisher.PublishEnvelopeAsync(envelope);
+
+        // no headers: the stored value is the bare envelope, byte-for-byte (no frame)
+        var body = (string)pushed()!;
+        Assert.DoesNotContain("__bq_frame", body, StringComparison.Ordinal);
+        Assert.Equal(envelope.Meta!.Id, id);
+        Assert.Equal(EnvelopeCodec.Encode(envelope), body);
+        var wire = EnvelopeCodec.Decode(body);
+        Assert.Equal("trace-fixed", wire.TraceId);
+        Assert.Equal(EnvelopeCodec.SchemaVersion, wire.Meta!.SchemaVersion);
+        Assert.Equal(envelope.Meta.Id, wire.Meta.Id);
+        Assert.Equal("t1", wire.Extras!["x_tenant"].GetString());
+        Assert.Equal("eu", wire.Meta.Extras!["x_region"].GetString());
+    }
+
+    // Documents the PublishEnvelopeAsync contract: meta.queue is whatever the envelope carries. Telemetry stamps
+    // its queue argument (default "default"), not this publisher's target, so callers must pass the queue.
+    [Fact]
+    public async Task TelemetryPublishWithoutAQueueArgumentStampsDefaultMetaQueue()
+    {
+        var (mock, pushed) = MockDatabase();
+        var publisher = new RedisPublisher(mock.Object, Queue);
+        await Telemetry.PublishAsync(
+            "urn:babel:orders:created", null, env => publisher.PublishEnvelopeAsync(env));
+
+        // no headers: the stored value is the bare envelope, byte-for-byte (no frame)
+        var body = (string)pushed()!;
+        Assert.DoesNotContain("__bq_frame", body, StringComparison.Ordinal);
+        Assert.Equal("default", EnvelopeCodec.Decode(body).Meta!.Queue);
     }
 }

@@ -153,8 +153,11 @@ using BabelQueue.Tracing;
 
 // produce: BabelQueue.Core fills the carrier with the active span's traceparent
 var headers = new Dictionary<string, string>();
+var publisher = new RedisPublisher(db, "orders");
 await Telemetry.PublishAsync("urn:babel:orders:created", data, headers,
-    env => new RedisPublisher(db, "orders").PublishWithHeadersAsync("urn:babel:orders:created", data, headers));
+    env => publisher.PublishEnvelopeAsync(env, headers), "orders", Telemetry.Systems.Redis);
+// PublishEnvelopeAsync sends the envelope Telemetry built as is, so the span's messaging.message.id
+// is the meta.id on the wire; the Telemetry queue argument becomes meta.queue.
 
 // consume: the handler receives the un-framed body + headers; wrap to link the span
 ["urn:babel:orders:created"] = (env, rawBody, headers, ct) =>
@@ -162,7 +165,7 @@ await Telemetry.PublishAsync("urn:babel:orders:created", data, headers,
 ```
 
 With no `traceparent` the consumer falls back to the v0.1 `trace_id` mapping. Requires
-`BabelQueue.Core 1.4.0`.
+`BabelQueue.Core 1.14.0`.
 
 ## Build & test
 
